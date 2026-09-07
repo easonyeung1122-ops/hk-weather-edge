@@ -124,12 +124,34 @@ def fetch_forecasts():
     return det, ens, hko
 
 
-def bucket_probs(target, det, ens, calib, mu_override=None):
+def load_observed_max():
+    """从 --watch 的日内日志里读「今日已实测到的最高温度」。
+
+    日最高温具有单调性：已经观测到的值就是当日峰值的下限。
+    日内复盘时必须以此为条件截断分布，否则会给出物理上不可能的低档概率。
+    """
+    p = os.path.join(DATA, 'intraday_log.json')
+    if not os.path.exists(p):
+        return None
+    try:
+        log = json.load(open(p))
+        if log.get('date') != dt.datetime.now(TZ).date().isoformat():
+            return None
+        vals = [pt.get('hko') for pt in log.get('points', []) if pt.get('hko') is not None]
+        return max(vals) if vals else None
+    except Exception:
+        return None
+
+
+def bucket_probs(target, det, ens, calib, mu_override=None, floor=None, sd_override=None):
     """
     目标日每个整数档的公允概率。
     做法 = 偏差修正后的集合预报（dressed ensemble）：
       每个集合成员 m: x_m = det_mean + bias + (member_m - ens_mean)
       再叠加残差噪声 N(0, resid_sd)，对 50 个成员求平均
+
+    floor: 当日已实测到的最高温度（°C）。给出后，分布被截断到 [floor, +∞)
+           并重新归一化——已经观测到的最高温只会被刷新、不会被抹掉。
     """
     days = det['time']
     if target not in days:
@@ -148,20 +170,29 @@ def bucket_probs(target, det, ens, calib, mu_override=None):
     ens_mean = sum(members) / len(members)
     mu = det_mean + calib['bias'] if mu_override is None else mu_override
     spread = math.sqrt(sum((x - ens_mean) ** 2 for x in members) / len(members))
-    sd = calib['resid_sd']
+    # resid_sd 是「提前一天」的不确定性；接近收盘时剩余不确定性小得多，可用 --sigma 收窄
+    sd = calib['resid_sd'] if sd_override is None else sd_override
     # dressed ensemble: 偏差修正后的点估计 + 集合距平 + 残差噪声
-    draws = [mu + (x - ens_mean) for x in members]
+    # 但 --sigma 表示「剩余总不确定性」（日内场景）：此时集合距平已过时，直接用单个正态
+    draws = [mu] if sd_override is not None else [mu + (x - ens_mean) for x in members]
 
     lo_b, hi_b = int(math.floor(min(draws) - 3 * sd)), int(math.ceil(max(draws) + 3 * sd))
+    if floor is not None:
+        lo_b = max(lo_b, int(math.floor(floor)))
+        hi_b = max(hi_b, lo_b)
     out = {}
     for b in range(lo_b, hi_b + 1):
-        p = sum(norm_cdf(b + 1, x, sd) - norm_cdf(b, x, sd) for x in draws) / len(draws)
+        # 截断：档位 [b, b+1) 与 [floor, +∞) 求交集，floor 以下的整档概率为 0
+        lo_edge = b if floor is None else max(b, floor)
+        if lo_edge >= b + 1:
+            continue
+        p = sum(norm_cdf(b + 1, x, sd) - norm_cdf(lo_edge, x, sd) for x in draws) / len(draws)
         if p > 0.0005:
             out[b] = p
     s = sum(out.values())
     out = {k: v / s for k, v in out.items()}
-    return {'mu': mu, 'spread': spread, 'sd': sd, 'n_members': len(members),
-            'det_mean': det_mean, 'probs': out}
+    return {'mu': mu if floor is None else max(mu, floor), 'spread': spread, 'sd': sd,
+            'n_members': len(members), 'det_mean': det_mean, 'floor': floor, 'probs': out}
 
 
 # ---------------------------------------------------------------- 当日实时追踪
@@ -252,6 +283,10 @@ def main():
     ap.add_argument('--market', help='市场价，格式 "31:0.42,32:0.35"')
     ap.add_argument('--bankroll', type=float, help='本金(USDC)，给出 1/4 Kelly 建议下注额')
     ap.add_argument('--mu', type=float, help='手动覆盖点估计(°C)：把日内实况/官方预报按你的判断加权')
+    ap.add_argument('--observed-max', type=float,
+                    help='当日已实测到的最高温(°C)：分布截断重命名到该下限（默认自动读 --watch 日志）')
+    ap.add_argument('--sigma', type=float,
+                    help='剩余总不确定性 sd(°C)，日内用：给出后不再叠加集合距平，直接用 N(mu, sigma)')
     ap.add_argument('--watch', action='store_true', help='当日实时追踪')
     ap.add_argument('--recalibrate', action='store_true')
     ap.add_argument('--html', action='store_true', help='额外输出 HTML 报告')
@@ -271,36 +306,55 @@ def main():
     print(f"结算源: 香港天文台 Daily Extract / Absolute Daily Max (0.1°C), 档位 N = [N.0, N+1.0)")
     print(f"模型校准: bias {calib['bias']:+.2f}°C, 残差 sd {calib['resid_sd']:.2f}°C "
           f"(回测 n={calib['n']}, {calib['window'][0]}~{calib['window'][1]})")
+
+    # 当日已实测到的最高温 = 峰值的硬下限，用它截断分布（只对当日生效）
+    today = dt.datetime.now(TZ).date().isoformat()
+    floor_max, floor_src = a.observed_max, None
+    if floor_max is not None:
+        floor_src = '--observed-max'
+    else:
+        floor_max = load_observed_max()
+        if floor_max is not None:
+            floor_src = 'intraday_log.json（--watch 记录）'
+    if floor_max is not None:
+        print(f"已观测下限: {today} 实测最高 {floor_max}°C（来源 {floor_src}）"
+              f" → 当日分布截断重命名")
     print("=" * 78)
 
-    targets = [a.date] if a.date else [d for d in det['time'] if d >= dt.datetime.now(TZ).date().isoformat()][:7]
+    targets = [a.date] if a.date else [d for d in det['time'] if d >= today][:7]
     market = {}
     if a.market:
         for kv in a.market.split(','):
             k, v = kv.split(':')
             market[int(k)] = float(v)
 
+    # 有 edge 就必须给出 1/4 Kelly 仓位；未指定本金时按 1000 USDC 估算并明确标注
+    bankroll = a.bankroll if a.bankroll else 1000.0
+    if not a.bankroll:
+        print(f"本金未指定 → 默认按 {bankroll:.0f} USDC 估算 1/4 Kelly 下注额（用 --bankroll 覆盖）")
+
     results = {}
     for t in targets:
-        r = bucket_probs(t, det, ens, calib, mu_override=a.mu)
+        r = bucket_probs(t, det, ens, calib, mu_override=a.mu,
+                         floor=floor_max if t == today else None, sd_override=a.sigma)
         if a.mu is not None:
             r['manual_mu'] = True
         results[t] = r
         lead = (dt.date.fromisoformat(t) - dt.datetime.now(TZ).date()).days
         tag = " [手动覆盖]" if r.get('manual_mu') else ""
+        ftag = f"  | 下限 {r['floor']}°C [已截断]" if r.get('floor') is not None else ""
         print(f"\n■ {t} (提前 {lead} 天)  点估计 {r['mu']:.2f}°C{tag}  "
-              f"| 集合离散度 ±{r['spread']:.2f}°C  | HKO官方预报 {hko_map.get(t, '?')}°C")
+              f"| 集合离散度 ±{r['spread']:.2f}°C  残差sd {r['sd']:.2f}"
+              f"  | HKO官方预报 {hko_map.get(t, '?')}°C{ftag}")
         hdr = f"  {'档位':>6} {'公允P':>8} {'市场价':>8} {'动作':>14} {'EV':>7}"
-        if a.bankroll:
-            hdr += f" {'1/4Kelly下注':>12}"
+        hdr += f" {'1/4Kelly下注':>12}"   # 始终给出：有 edge 就必须给出 1/4 Kelly 仓位
         print(hdr + "   分布条")
         for b, p in sorted(r['probs'].items()):
             bar = '█' * int(round(p * 50))
             mk = market.get(b)
             if mk is None:
                 line = f"  {b:>4}°C {p:>7.1%} {'-':>8} {'-':>14} {'-':>7}"
-                if a.bankroll:
-                    line += f" {'-':>12}"
+                line += f" {'-':>12}"
                 print(line + f"   {bar}")
                 continue
             ev_buy = p / mk - 1
@@ -313,15 +367,15 @@ def main():
             else:
                 act, ev, side = f"观望 (edge不足)", max(ev_buy, ev_sell), None
             line = f"  {b:>4}°C {p:>7.1%} {mk:>7.1%} {act:>14} {ev:>+6.0%}"
-            if a.bankroll:
-                if side == 'yes':
-                    kf = (p - mk) / (1 - mk)
-                elif side == 'no':
-                    kf = (mk - p) / mk
-                else:
-                    kf = 0
-                stake = max(0.0, kf) * a.bankroll * 0.25
-                line += f" {'$' + format(stake, '.0f'):>12}" if stake >= 1 else f" {'-':>12}"
+            if side == 'yes':
+                kf = (p - mk) / (1 - mk)
+            elif side == 'no':
+                kf = (mk - p) / mk
+            else:
+                kf = 0
+            stake = max(0.0, kf) * bankroll * 0.25
+            line += f" {'$' + format(stake, '.0f') + f' ({max(0.0, kf) * 25:.1f}%)':>16}" \
+                if stake >= 1 else f" {'-':>16}"
             print(line + f"   {bar}")
         top = max(r['probs'].items(), key=lambda x: x[1])
         print(f"  → 众数档 {top[0]}°C 仅 {top[1]:.1%}: 即使完美预测期望值,"
