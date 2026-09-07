@@ -242,28 +242,55 @@ def watch():
             if grid_now is not None and hko_t is not None:
                 cur_bias = hko_t - grid_now                 # 此刻 实测−网格
                 k = calib['bias'] - cur_bias                # 站点升温加成
-                peak = hko_t + d['mean'] + k
-                # 外推值不能低于今日已实测到的最高值：已观测的最高温度只会上升不会回落
-                if mx is not None and peak < mx:
-                    print(f"\n  ⚠ 外推 {peak:.2f}°C 低于今日已观测最高 {mx}°C，"
-                          f"已按已观测值取下限（日内最高具有单调性）")
+                # —— 已过峰值守卫 ——
+                # 气候表 d['mean'] = 平均而言"还能升多少"，它是无条件统计：既包含
+                # 仍在升温的日子，也包含"已冲到峰值又回落"的日子。一旦实测已经比
+                # 今日已观测最高低了一截(回落 g)，且处于典型峰值时段(14 时)之后，
+                # 当日峰值大概率已定格——无条件期望必须大幅收窄，只留少量
+                # "晚些反弹创出新高"的可能。这正是"外推低于已实测最高"这族问题
+                # 的另一面：前者发生在早上(网格还没到过那么高)，后者在下午(已经到过)。
+                g = float(mx - hko_t) if mx is not None else 0.0
+                post = g >= 0.3 and hh >= 14
+                if post:
+                    s_hour = min(1.0, max(0.0, (hh - 14) / 2.0))   # 14时→0, 16时→1
+                    s_gap = min(1.0, max(0.0, (g - 0.3) / 1.2))    # 回落0.3→0, 1.5→1
+                    s = min(s_hour, s_gap)                         # 两者都到位才算过峰
+                    gross = d['mean'] + k
+                    net = max(0.0, gross - g)          # 已回落的幅度不再支撑新高
+                    rise_m = net * (1 - 0.75 * s)      # 过峰越强，剩余升温期望越收窄
+                    rise_sd = max(0.1, d['sd'] * (1 - 0.4 * s))
+                else:
+                    rise_m = d['mean'] + k
+                    rise_sd = d['sd']
+                peak_raw = hko_t + rise_m
+                if mx is not None and peak_raw < mx:
+                    if not post:
+                        print(f"\n  ⚠ 外推 {peak_raw:.2f}°C 低于今日已观测最高 {mx}°C，"
+                              f"已按已观测值取下限（日内最高具有单调性）")
                     peak = float(mx)
+                else:
+                    peak = peak_raw
                 print(f"\n  📈 日内外推（气候基准 n={d['n']}）")
                 print(f"     此刻 实测{hko_t}°C / 网格{grid_now}°C → 站点偏差{cur_bias:+.2f}")
                 print(f"     {hh}时后气候平均还能升 {d['mean']:.2f}°C(±{d['sd']:.2f})，"
                       f"站点加成 {k:+.2f}")
+                if post:
+                    print(f"     ⚠ 已过峰值信号：实测已从今日最高回落 {g:.1f}°C"
+                          f"（{hh} 时 ≥ 14 时典型峰值窗口）"
+                          f" → 剩余升温期望 {d['mean'] + k:.2f} → {rise_m:.2f}°C，"
+                          f"离散 {rise_sd:.2f}°C")
                 print(f"     ⇒ 今日峰值估计 {peak:.2f}°C  "
-                      f"区间[{peak - d['sd']:.1f}, {peak + d['sd']:.1f}]  "
+                      f"区间[{peak - rise_sd:.1f}, {peak + rise_sd:.1f}]  "
                       f"→ 众数档 {int(math.floor(peak))}°C")
                 for b in range(int(math.floor(peak)) - 1, int(math.floor(peak)) + 3):
                     need = b - hko_t
                     if mx is not None and b <= mx:
                         prob = 1.0   # 今日已实测到该温度，达成概率为 100%
-                    elif d['sd'] > 0:
-                        z = (need - d['mean'] - k) / d['sd']
+                    elif rise_sd > 0:
+                        z = (need - rise_m) / rise_sd
                         prob = 1 - norm_cdf(z)
                     else:
-                        prob = 1.0 if need <= d['mean'] else 0.0
+                        prob = 1.0 if need <= rise_m else 0.0
                     print(f"        到 {b}.0°C 还需升 {need:+.1f}°C  "
                           f"→ 概率约 {prob:.0%}")
                 print("     ⚠️ 阴雨/雷暴日会显著低于此估计；若午后雨已到，以上即为上限")
