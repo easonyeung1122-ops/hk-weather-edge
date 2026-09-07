@@ -70,6 +70,19 @@ py -3 scripts/market_prices.py 2026-09-08 --depth 3  # 多看几档深度
 算 EV 用可执行价：买 YES 用 YES 的 **ask**，买 NO 用 **NO token 自己的 ask**（NO 有独立订单簿）。
 算完 Kelly 后**必须核对可成交量**——临近结算常出现「EV +150% 但只能买 165 份」的情况。
 
+## 性能
+
+一次完整流程（取价 + 算概率）原本约 9s，现在约 2.5s；主脚本缓存命中时 **0.2s**。
+加速只动传输层，任何数字的计算方式都没变（已逐位比对）：
+
+- `requests.Session` 保活 + 互不依赖的接口并行（墙钟 = 最慢那个请求）
+- CLOB **批量订单簿** `/books`：22 个盘口 1 次请求拿全（0.5s，逐个并行 1.4s，串行 5.6–7.3s）
+- 模式/官方预报 15 分钟 TTL 磁盘缓存；命中时输出会打印数据年龄
+- 历史 CSV 按需加载（校准有缓存时不解析 4.9 万行）
+
+**实况观测与订单簿价格永不缓存** —— 那是结论的输入源头。
+要强制最新数据：`--no-cache`；改缓存时长：`--ttl <秒>`（默认 900）。
+
 ## 三条 edge 来源
 
 1. **结算只认一个传感器**——市场看的是"香港天气"这个模糊概念
@@ -89,6 +102,7 @@ scripts/diurnal.py                    生成日内气候升温表（ERA5）
 scripts/fetch_stations.py             下载多站历史 CSV（供 analyze.py）
 scripts/backtest.py / analyze.py / hitrate.py   校准与分析（需 pandas + numpy）
 scripts/data/diurnal_climatology.json 日内气候缓存，开箱即用
+scripts/data/http_cache.json         模式/预报的短TTL缓存（实况与价格不缓存）
 ```
 
 ## 数据源（全部免费、无需 API key）

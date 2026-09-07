@@ -16,23 +16,77 @@ Polymarket「香港最高气温」市场 Edge 计算器
   python3 hk_edge.py --date 2026-09-08 --market "30:0.08,31:0.35,32:0.40,33:0.12"
                                           # 手工输入市场价，算 edge
   python3 hk_edge.py --recalibrate        # 强制重算模型偏差
+  python3 hk_edge.py --no-cache           # 强制实时拉取（下单前用它）
+  python3 hk_edge.py --ttl 300            # 模式/预报缓存改为 5 分钟（默认 900）
 
 依赖：pip3 install requests（没有也能跑，会回落到 urllib）
 """
-import argparse, json, math, os, sys, datetime as dt
+import argparse, json, math, os, sys, time, datetime as dt
+from concurrent.futures import ThreadPoolExecutor
 
-try:
-    import requests
-    _get = lambda u, t=60: requests.get(u, timeout=t).json()
-except ImportError:
+# ---- HTTP 层 ----
+# 一次运行要打 3~4 个互不依赖的接口，串行时耗时几乎全是 TLS 握手（实测 2.2s ≈ 3×0.7s）。
+# 三层加速，都不改变任何数字：
+#   1) Session 复用 TCP/TLS（有 requests 时；没有则退回 urllib，只是没有保活）
+#   2) 互不依赖的接口并行拉取 → 墙钟时间 = 最慢那个，而不是总和
+#   3) 短 TTL 磁盘缓存：模式更新周期 ≥6h、官方预报一天数次，15 分钟缓存不影响结论
+# 严谨性边界：**实况观测(rhrread)、网格实况、订单簿价格永不缓存**——那是结论的来源，
+# 不是可以复用的输入。缓存只作用于下面白名单式的调用点（见 cache=True 的传参）。
+_SESSION = None   # None=未初始化；False=退回 urllib；否则是 requests.Session
+
+def _http(u, t):
+    # 真正发请求时才 import requests：命中缓存的运行完全不需要它，省约 0.3s 启动时间
+    global _SESSION
+    if _SESSION is None:
+        try:
+            import requests
+            _SESSION = requests.Session()      # keep-alive：同主机复用 TCP/TLS
+        except ImportError:
+            _SESSION = False
+    if _SESSION:
+        r = _SESSION.get(u, timeout=t)
+        r.raise_for_status()
+        return r.json()
     import urllib.request
-    def _get(u, t=60):
-        r = urllib.request.Request(u, headers={'User-Agent': 'Mozilla/5.0'})
-        return json.load(urllib.request.urlopen(r, timeout=t))
+    req = urllib.request.Request(u, headers={'User-Agent': 'Mozilla/5.0'})
+    return json.load(urllib.request.urlopen(req, timeout=t))
+
+CACHE_TTL = 900          # 15 分钟：远小于任何模式的更新周期
+_CACHE_PATH = None       # 绑定到 DATA 后赋值
+_cache_mem, _fetch_meta = None, {}   # 缓存本体 / 本次运行各 URL 的数据年龄(秒)
+
+def _cache_load():
+    global _cache_mem
+    if _cache_mem is None:
+        try:
+            _cache_mem = json.load(open(_CACHE_PATH))
+        except Exception:
+            _cache_mem = {}
+    return _cache_mem
+
+def _cache_save():
+    if _cache_mem is not None:
+        try:
+            json.dump(_cache_mem, open(_CACHE_PATH, 'w'))
+        except Exception:
+            pass
+
+def _get(u, t=60, cache=False, ttl=CACHE_TTL):
+    if cache:
+        e = _cache_load().get(u)
+        if e and time.time() - e['t'] < ttl:
+            _fetch_meta[u] = time.time() - e['t']
+            return e['v']
+    v = _http(u, t)
+    if cache:
+        _cache_load()[u] = {'t': time.time(), 'v': v}
+    _fetch_meta[u] = 0.0
+    return v
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(HERE, 'data')
 os.makedirs(DATA, exist_ok=True)
+_CACHE_PATH = os.path.join(DATA, 'http_cache.json')
 
 # 结算站点坐标（尖沙咀天文台总部，海拔约 32m）
 OBS_LAT, OBS_LON = 22.302, 114.173
@@ -48,6 +102,9 @@ OM_ENS    = ("https://ensemble-api.open-meteo.com/v1/ensemble?latitude={lat}&lon
              "&daily=temperature_2m_max&forecast_days=10&timezone=Asia%2FShanghai&models=ecmwf_ifs025")
 OM_PREV   = ("https://previous-runs-api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
              "&daily=temperature_2m_max&past_days=92&forecast_days=1&timezone=Asia%2FShanghai&models={m}")
+OM_HR     = ("https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
+             "&hourly=temperature_2m&forecast_days=1&past_hours=3"
+             "&timezone=Asia%2FShanghai&models=best_match")
 
 
 # ---------------------------------------------------------------- 工具
@@ -84,14 +141,22 @@ def load_obs(force=False):
     return obs
 
 
-def recalibrate(obs, force=False):
-    """用过去 92 天的多模型预报 vs 实测，算出网格+模型的系统性偏差"""
+def recalibrate(obs=None, force=False, use_cache=True, ttl=CACHE_TTL):
+    """用过去 92 天的多模型预报 vs 实测，算出网格+模型的系统性偏差。
+
+    obs 允许为 None：校准结果有缓存时（默认 <3 天）根本用不到历史数据，
+    不必每次解析 4.9 万行 CSV。
+    """
     p = os.path.join(DATA, 'model_calib.json')
     if not force and os.path.exists(p):
         c = json.load(open(p))
         if (dt.datetime.now(TZ).date() - dt.date.fromisoformat(c['window'][1])).days < 3:
             return c
-    d = _get(OM_PREV.format(lat=OBS_LAT, lon=OBS_LON, m=MODELS))['daily']
+    if obs is None:
+        obs = load_obs()
+    # 模式回看数据一天才变一次，可缓存；--recalibrate 强制实时
+    d = _get(OM_PREV.format(lat=OBS_LAT, lon=OBS_LON, m=MODELS), 120,
+             cache=use_cache and not force, ttl=ttl)['daily']
     cols = [k for k in d if k != 'time']
     errs, n = [], 0
     for i, day in enumerate(d['time']):
@@ -113,14 +178,20 @@ def recalibrate(obs, force=False):
     return c
 
 
-def fetch_forecasts():
-    """多模型确定性融合 + ECMWF 集合 + HKO 官方预报"""
-    det = _get(OM_FC.format(lat=OBS_LAT, lon=OBS_LON, m=MODELS))['daily']
-    ens = _get(OM_ENS.format(lat=OBS_LAT, lon=OBS_LON))['daily']
-    try:
-        hko = _get(HKO_FND)['weatherForecast']
-    except Exception:
-        hko = []
+def fetch_forecasts(use_cache=True, ttl=CACHE_TTL):
+    """多模型确定性融合 + ECMWF 集合 + HKO 官方预报（三个接口并行拉取）"""
+    _cache_load()          # 先把缓存读进内存，避免线程里重复读盘
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        f_det = ex.submit(_get, OM_FC.format(lat=OBS_LAT, lon=OBS_LON, m=MODELS),
+                          60, use_cache, ttl)
+        f_ens = ex.submit(_get, OM_ENS.format(lat=OBS_LAT, lon=OBS_LON), 60, use_cache, ttl)
+        f_hko = ex.submit(_get, HKO_FND, 60, use_cache, ttl)
+        det = f_det.result()['daily']
+        ens = f_ens.result()['daily']
+        try:
+            hko = f_hko.result()['weatherForecast']
+        except Exception:
+            hko = []
     return det, ens, hko
 
 
@@ -198,10 +269,15 @@ def bucket_probs(target, det, ens, calib, mu_override=None, floor=None, sd_overr
 # ---------------------------------------------------------------- 当日实时追踪
 def watch():
     """实时追踪：记录当日天文台站已观测到的最高温度（供 cron 每 10 分钟调用）"""
+    # 观测与网格实况互不依赖 → 并行拉取（两者都属实况，永不缓存）
+    ex = ThreadPoolExecutor(max_workers=2)
+    f_rhr = ex.submit(_get, HKO_RHR, 30)
+    f_grid = ex.submit(_get, OM_HR.format(lat=OBS_LAT, lon=OBS_LON), 30)
     try:
-        r = _get(HKO_RHR, 30)
+        r = f_rhr.result()
     except Exception as e:
         print(f"[err] 无法读取天文台实时数据: {e}")
+        ex.shutdown(wait=False)
         return
     temp = {t['place']: t['value'] for t in r['temperature']['data']}
     rt = r['temperature']['recordTime']
@@ -232,9 +308,7 @@ def watch():
         hh = now.hour
         if str(now.month) in diur and str(hh) in diur[str(now.month)]:
             d = diur[str(now.month)][str(hh)]
-            oh = _get("https://api.open-meteo.com/v1/forecast?latitude=%.3f&longitude=%.3f"
-                      "&hourly=temperature_2m&forecast_days=1&past_hours=3"
-                      "&timezone=Asia%%2FShanghai&models=best_match" % (OBS_LAT, OBS_LON), 30)['hourly']
+            oh = f_grid.result()['hourly']      # 上面已并行发起，这里取结果
             grid_now = None
             for t, v in zip(oh['time'], oh['temperature_2m']):
                 if t.startswith(today) and int(t[11:13]) == hh:
@@ -301,6 +375,7 @@ def watch():
         print("  ⏰ 已过 16:00，晴天情形下日最高温基本锁定，剩余风险主要来自夜间暖平流")
     elif now.hour < 9:
         print("  🌅 早晨时段，日最高温通常在 14:00-16:00 出现，目前离锁定还很远")
+    ex.shutdown(wait=False)
 
 
 # ---------------------------------------------------------------- 主流程
@@ -316,6 +391,10 @@ def main():
                     help='剩余总不确定性 sd(°C)，日内用：给出后不再叠加集合距平，直接用 N(mu, sigma)')
     ap.add_argument('--watch', action='store_true', help='当日实时追踪')
     ap.add_argument('--recalibrate', action='store_true')
+    ap.add_argument('--ttl', type=int, default=CACHE_TTL,
+                    help=f'模式/预报类接口的缓存秒数（默认 {CACHE_TTL}s=15分钟；'
+                         f'实况与价格永不缓存）')
+    ap.add_argument('--no-cache', action='store_true', help='强制实时拉取，绕过缓存')
     ap.add_argument('--html', action='store_true', help='额外输出 HTML 报告')
     a = ap.parse_args()
 
@@ -323,9 +402,9 @@ def main():
         watch()
         return
 
-    obs = load_obs()
-    calib = recalibrate(obs, force=a.recalibrate)
-    det, ens, hko = fetch_forecasts()
+    calib = recalibrate(force=a.recalibrate, use_cache=not a.no_cache, ttl=a.ttl)
+    det, ens, hko = fetch_forecasts(use_cache=not a.no_cache, ttl=a.ttl)
+    _cache_save()
     hko_map = {f"{x['forecastDate'][:4]}-{x['forecastDate'][4:6]}-{x['forecastDate'][6:]}":
                x['forecastMaxtemp']['value'] for x in hko}
 
@@ -333,6 +412,14 @@ def main():
     print(f"结算源: 香港天文台 Daily Extract / Absolute Daily Max (0.1°C), 档位 N = [N.0, N+1.0)")
     print(f"模型校准: bias {calib['bias']:+.2f}°C, 残差 sd {calib['resid_sd']:.2f}°C "
           f"(回测 n={calib['n']}, {calib['window'][0]}~{calib['window'][1]})")
+    age = max(_fetch_meta.values(), default=0.0)
+    if a.no_cache:
+        print(f"数据时效: 强制实时拉取（--no-cache），{len(_fetch_meta)} 个请求并行")
+    elif age > 1:
+        print(f"数据时效: 缓存命中，最旧数据取自 {age / 60:.1f} 分钟前（TTL {a.ttl / 60:.0f} 分钟）"
+              f" —— 模式更新周期 ≥6h，不影响结论")
+    else:
+        print(f"数据时效: 实时拉取（{len(_fetch_meta)} 个请求并行）")
 
     # 当日已实测到的最高温 = 峰值的硬下限，用它截断分布（只对当日生效）
     today = dt.datetime.now(TZ).date().isoformat()

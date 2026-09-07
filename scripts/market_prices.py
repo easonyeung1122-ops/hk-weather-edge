@@ -22,31 +22,80 @@ import json
 import sys
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+
+# 每个档位要读 2 个订单簿(YES/NO)，11 个档位就是 22 个请求。
+# 串行时耗时几乎全是 TLS 握手（实测 5.6~7.3s）。这里做两件事：
+#   1) Session 复用 TCP/TLS  2) 22 个请求并行（每个档位内部顺序打印，输出不变）
+# **价格永不缓存** —— 盘口是整个 EV 的输入源头，任何缓存都会让结论失真。
+try:
+    import requests
+    _SESSION = requests.Session()
+    def _raw(url, timeout):
+        r = _SESSION.get(url, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+except ImportError:
+    _SESSION = None
+    def _raw(url, timeout):
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        return json.load(urllib.request.urlopen(req, timeout=timeout))
 
 GAMMA = "https://gamma-api.polymarket.com/events?slug=%s"
 CLOB_BOOK = "https://clob.polymarket.com/book?token_id=%s"
+CLOB_BOOKS = "https://clob.polymarket.com/books"      # 批量：一次拿全部订单簿
 
 MONTHS = ["january", "february", "march", "april", "may", "june",
           "july", "august", "september", "october", "november", "december"]
 
 
 def get(url, timeout=60):
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    return json.load(urllib.request.urlopen(req, timeout=timeout))
+    return _raw(url, timeout)
+
+
+def _levels(book, depth):
+    """把一份订单簿整理成 (bids, asks)，各为 [(price, size)]，按对你有利的方向排序。"""
+    bids = sorted(((float(x["price"]), float(x.get("size", 0)))
+                   for x in (book.get("bids") or [])), key=lambda x: -x[0])
+    asks = sorted(((float(x["price"]), float(x.get("size", 0)))
+                   for x in (book.get("asks") or [])), key=lambda x: x[0])
+    return bids[:depth], asks[:depth]
 
 
 def top_of_book(token_id, depth):
-    """返回 (bids, asks)，各为 [(price, size)]，已按对你有利的方向排序。"""
+    """单个订单簿（批量接口不可用时的回退路径）。"""
     try:
         b = get(CLOB_BOOK % urllib.parse.quote(str(token_id)))
     except Exception as e:
         print("[warn] 订单簿读取失败 %s: %s" % (token_id, e), file=sys.stderr)
         return [], []
-    bids = sorted(((float(x["price"]), float(x.get("size", 0)))
-                   for x in (b.get("bids") or [])), key=lambda x: -x[0])
-    asks = sorted(((float(x["price"]), float(x.get("size", 0)))
-                   for x in (b.get("asks") or [])), key=lambda x: x[0])
-    return bids[:depth], asks[:depth]
+    return _levels(b, depth)
+
+
+def books_batch(token_ids, timeout=60):
+    """一次请求取回全部订单簿（CLOB 批量接口 /books）。
+
+    实测 22 个 token：批量 0.5s vs 逐个并行 1.4s（串行 5.6~7.3s）。
+    失败返回 {}，由调用方回退到逐个并行拉取——功能不依赖这个接口。
+    """
+    try:
+        payload = [{"token_id": t} for t in token_ids]
+        if _SESSION:
+            r = _SESSION.post(CLOB_BOOKS, json=payload, timeout=timeout)
+            r.raise_for_status()
+            raw = r.json()
+        else:
+            req = urllib.request.Request(
+                CLOB_BOOKS, data=json.dumps(payload).encode(),
+                headers={"User-Agent": "Mozilla/5.0", "Content-Type": "application/json"})
+            raw = json.load(urllib.request.urlopen(req, timeout=timeout))
+        out = {}
+        for i, b in enumerate(raw or []):
+            out[str(b.get("asset_id") or token_ids[i])] = b
+        return out
+    except Exception as ex:
+        print("[warn] 批量订单簿失败，回退逐个拉取: %s" % ex, file=sys.stderr)
+        return {}
 
 
 def fmt(levels):
@@ -82,7 +131,7 @@ def main():
                                     "可成交量 买YES/卖YES/买NO"))
     print("-" * 104)
 
-    mids = []
+    pairs = []
     for m in e.get("markets", []):
         label = m.get("groupItemTitle") or "?"
         try:
@@ -91,8 +140,26 @@ def main():
             tokens = []
         if len(tokens) < 2:
             continue
-        yb, ya = top_of_book(tokens[0], a.depth)
-        nb, na = top_of_book(tokens[1], a.depth)
+        pairs.append((label, tokens[0], tokens[1]))
+
+    # 一次批量请求取回全部订单簿；批量没覆盖到的（接口异常或个别缺失）再并行补拉。
+    # 打印顺序与内容不变，只是把等待重叠起来。
+    all_ids = [t for _, y, n in pairs for t in (y, n)]
+    batch = books_batch(all_ids) if all_ids else {}
+    miss = [(i, t) for i, t in enumerate(all_ids) if str(t) not in batch]
+    extra = {}
+    if miss:
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            futs = {i: ex.submit(top_of_book, t, a.depth) for i, t in miss}
+        extra = {i: f.result() for i, f in futs.items()}
+
+    def book_at(i, t):
+        return extra[i] if i in extra else _levels(batch[str(t)], a.depth)
+
+    mids = []
+    for k, (label, y_tok, n_tok) in enumerate(pairs):
+        yb, ya = book_at(2 * k, y_tok)
+        nb, na = book_at(2 * k + 1, n_tok)
 
         y_bid, y_bid_sz, y_bid_tot = fmt(yb)
         y_ask, y_ask_sz, y_ask_tot = fmt(ya)
