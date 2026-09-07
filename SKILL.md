@@ -49,6 +49,40 @@ py -3 scripts/hk_edge.py            # 首次运行会下载 HKO 历史数据(约
 
 ## 工作流
 
+### A0. 取价：必须用订单簿，不要用最后成交价
+
+**这是最容易让整套分析失效的一步。** Gamma API 的 `outcomePrices`（最后成交价）和
+`bestBid/bestAsk` 都是**延迟指标**，只有 CLOB 订单簿是实时的。
+
+实测同一时刻的差异（2026-09-07，临近结算、行情剧变）：
+
+| 来源 | 30 档 | 31 档 |
+|---|---:|---:|
+| 最后成交价 `outcomePrices` | 0.82 | 0.15 |
+| Gamma `bestBid/bestAsk` | 0.79 / 0.85 | – |
+| **CLOB 订单簿（真实可成交）** | **0.962 / 0.988** | **0.010 / 0.040** |
+
+差 15–17 分钱。用最后成交价算出来的 EV 完全是假的。
+**越接近结算、行情变化越快，最后成交价越失真**；流动性好、变化慢的盘（如提前 1–4 天）三者通常吻合。
+
+```bash
+py -3 scripts/market_prices.py 2026-09-07            # 按香港日期取盘口
+py -3 scripts/market_prices.py 2026-09-08 --depth 3  # 多看几档深度
+```
+
+输出每档的 **YES / NO 各自的 bid 与 ask**、两侧可成交深度，以及一条可直接粘贴的 `--market` 字符串
+（用 YES 订单簿中间价）。
+
+算 EV 时用**可执行价**，不用中间价：
+
+- 买 YES → YES token 的 **ask**
+- 卖 YES → YES token 的 **bid**
+- 买 NO → **NO token 自己的 ask**（NO 有独立订单簿，不要想当然用 `1 − YES bid`）
+- 卖 NO → NO token 的 **bid**
+
+**算完 Kelly 必须再核对可成交量。** 临近结算时经常出现「EV +150% 但只能买 165 份（≈$6.6）」——
+这种 edge 真实但不值得动手。
+
 ### A. 每日扫描（找 edge）
 
 ```bash
@@ -117,6 +151,7 @@ py -3 scripts/analyze.py                 # 站点偏差、月度气候、日际�
 | 文件 | 作用 |
 |---|---|
 | `scripts/hk_edge.py` | 主程序：拉数据 → 校准 → 公允概率 / edge / Kelly / `--watch` |
+| `scripts/market_prices.py` | **从 CLOB 订单簿取真实可成交价**（取价必用，见 A0） |
 | `scripts/diurnal.py` | 生成「某时刻 → 当日峰值」气候升温表（ERA5，跑一次数分钟） |
 | `scripts/backtest.py` | 多模型回测，产出 `model_calib.json`（**需要 pandas + numpy**） |
 | `scripts/analyze.py` | 站点偏差 / 月度气候 / 日际波动（需要 pandas + numpy，且需要多站 CSV） |
@@ -137,6 +172,7 @@ py -3 scripts/fetch_stations.py     # 下载 KP(京士柏)/TKL(打鼓岭)/SEK(�
 ## 交易纪律（对用户输出建议时必须带上）
 
 - **|EV| > 8% 才动手**——0.79 °C 的 RMSE 意味着概率本身有 ±5% 量级误差。脚本内部 `MIN_EDGE=0.08` 已硬编码。
+- **EV 必须用订单簿可执行价算**（见 A0），用最后成交价算出的 edge 是假的。
 - **挂限价单做 maker**，别吃单，taker 费用会吃掉薄盘的 edge。
 - **跨 2–3 个相邻档 ladder**，收割分布形状而不是猜单点。
 - **只要判定有 edge（|EV| > 8%），就必须给出 1/4 Kelly 仓位建议**——不能只说"买 YES"就收尾。
