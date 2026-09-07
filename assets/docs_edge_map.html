@@ -1,0 +1,181 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Polymarket 香港气温市场 — Edge 地图</title>
+<style>
+*{box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;background:#0d1117;color:#c9d1d9;line-height:1.75;margin:0;padding:0 20px 80px}
+.wrap{max-width:900px;margin:auto}
+h1{font-size:26px;color:#f0f6fc;padding-top:36px;margin-bottom:6px;line-height:1.35}
+h2{font-size:19px;color:#f0f6fc;margin-top:44px;padding-bottom:8px;border-bottom:1px solid #30363d}
+h3{font-size:16px;color:#e6edf3;margin-top:26px}
+.sub{color:#8b949e;font-size:14px}
+code{background:#161b22;padding:2px 6px;border-radius:4px;color:#79c0ff;font-size:13px}
+pre{background:#161b22;padding:14px 16px;border-radius:8px;overflow-x:auto;border:1px solid #30363d;font-size:13px;line-height:1.6}
+table{border-collapse:collapse;width:100%;margin:16px 0;font-size:14px}
+th,td{padding:8px 11px;border-bottom:1px solid #21262d;text-align:left;vertical-align:top}
+th{color:#8b949e;font-weight:500;font-size:13px}
+.num{text-align:right;font-variant-numeric:tabular-nums}
+.pos{color:#3fb950} .neg{color:#f85149}
+.box{background:#161b22;border:1px solid #30363d;border-left:3px solid #58a6ff;border-radius:6px;padding:14px 18px;margin:18px 0}
+.box.key{border-left-color:#3fb950} .box.warn{border-left-color:#d29922} .box.bad{border-left-color:#f85149}
+.big{font-size:30px;font-weight:600;color:#58a6ff;font-variant-numeric:tabular-nums}
+ul{padding-left:22px} li{margin:7px 0}
+.tag{display:inline-block;background:#1f6feb22;color:#58a6ff;border:1px solid #1f6feb55;border-radius:20px;padding:1px 10px;font-size:12px;margin-right:6px}
+.kbd{background:#21262d;border:1px solid #444c56;border-radius:4px;padding:1px 6px;font-size:12px;color:#e6edf3}
+footer{color:#6e7681;font-size:12px;margin-top:60px;border-top:1px solid #21262d;padding-top:16px}
+</style></head><body><div class="wrap">
+
+<h1>在香港交易 Polymarket 香港气温合约<br><span class="sub">一份可复现的 Edge 地图 · 生成于 2026-09-06 23:58 HKT</span></h1>
+
+<div class="box key">
+<b>一句话结论：</b>你的 edge <u>不</u>来自"比香港天文台更会预报天气"——官方 9 天预报已经极准。
+你的 edge 来自三件事：<b>① 只有天文台总部站（尖沙咀）那一个传感器说了算</b>；
+<b>② 市场把"点预报"当"概率"，而结算是 0.1°C 精度的一维分箱</b>；
+<b>③ 你在香港的时区里，能在欧美做市商睡觉时实时盯住那个传感器</b>。
+</div>
+
+<h2>0 · 先把结算规则背下来（这是 90% 的人亏钱的地方）</h2>
+<table>
+<tr><th>项目</th><th>内容</th></tr>
+<tr><td>结算源</td><td><b>香港天文台 Daily Extract</b> → <code>Absolute Daily Max (deg. C)</code><br><a href="https://www.weather.gov.hk/en/cis/climat.htm" style="color:#58a6ff">weather.gov.hk/en/cis/climat.htm</a></td></tr>
+<tr><td>站点</td><td><b>香港天文台总部站（尖沙咀）</b>。不是赤鱲角机场，不是打鼓岭，不是你手机 App 那个数</td></tr>
+<tr><td>精度</td><td><b>0.1 °C</b>，规则明文"以该精度结算"</td></tr>
+<tr><td>档位定义</td><td>档位 <code>N°C</code> = 区间 <code>[N.0, N+1.0)</code>，即 <code>floor(实测值)</code>。实测 31.5 → 31 档；29.6 → 29 档</td></tr>
+<tr><td>日界</td><td>香港当地日（HKT 00:00–24:00）</td></tr>
+<tr><td>修正</td><td>规则写明"初始发布后的任何修订不予考虑"——以首次公布为准</td></tr>
+<tr><td>开市</td><td>约提前 4 天开（美东 00:56 ≈ 香港 13:56）</td></tr>
+</table>
+<div class="box warn"><b>和美国城市合约的关键差别：</b>纽约/芝加哥那类用 NWS CLI 或 Wunderground 的 METAR（<b>华氏整数</b>）；
+香港用天文台官方气候资料（<b>摄氏 0.1 位</b>）。别把中文社区里那套"华氏整数不换算"的经验直接搬过来。</div>
+
+<h2>1 · Edge ①：站点认知差 —— 天文台站比"大家看的那个数"系统性偏低</h2>
+<p>香港地形破碎，同一个下午，新界内陆和尖沙咀海旁能差 2–4 °C。结算只认一个点。下面是用天文台官方
+CLMMAXT 数据（2016–2026，同日配对）算出的<b>天文台站日最高温 减去 各站</b>的差值：</p>
+<table>
+<tr><th>对照站</th><th class="num">全年均值</th><th class="num">夏季(6–8月)</th><th class="num">冬季(12–2月)</th><th class="num">样本</th></tr>
+<tr><td>京士柏 King's Park</td><td class='num pos'>+0.21</td><td class='num pos'>+0.41</td><td class='num pos'>-0.21</td><td class='num'>3,863</td></tr><tr><td>打鼓岭 Ta Kwu Ling</td><td class='num neg'>-0.89</td><td class='num neg'>-0.89</td><td class='num neg'>-1.07</td><td class='num'>3,861</td></tr><tr><td>石岗 Shek Kong</td><td class='num neg'>-1.15</td><td class='num neg'>-0.97</td><td class='num neg'>-1.44</td><td class='num'>3,602</td></tr><tr><td>长洲 Cheung Chau</td><td class='num pos'>+0.10</td><td class='num pos'>+0.61</td><td class='num pos'>-0.53</td><td class='num'>3,858</td></tr>
+</table>
+<p><b>读法：</b>正数 = 天文台更热，负数 = 天文台更凉。</p>
+<ul>
+<li><b>石岗 −1.15 °C、打鼓岭 −0.89 °C</b>：新界内陆站夏季几乎每天都比尖沙咀热约 1 °C。新闻标题"打鼓岭 35°C"时，结算站大概率 33–34 °C。</li>
+<li><b>京士柏 +0.41 °C（夏季）</b>：京士柏就在天文台山旁边，是全港与结算站相关性最高的代理站——用它做实时代理变量最好。</li>
+<li><b>长洲 +0.61 °C（夏季）</b>：离岛没有城市热岛。</li>
+</ul>
+<div class="box"><b>怎么变成钱：</b>每当有"全港酷热 / 某区破纪录"的本地新闻，散户会推高高价位档（33、34、35°C）。
+你只要记住"结算站是尖沙咀那台，比新界低约 1°C"，就能在错误定价时站在对家。</div>
+
+<h2>2 · Edge ②：点预报 ≠ 概率 —— 这是最大的一块</h2>
+<p>我用过去 92 天（2026-06-06 ~ 2026-09-06，n=87）把 7 个全球模式的日最高温预报
+与天文台实测做了配对回测，并做了偏差修正：</p>
+<table>
+<tr><th>方法</th><th class="num">平均偏差</th><th class="num">MAE</th><th class="num">RMSE</th><th class="num">残差 sd</th></tr>
+<tr><td>单模型最好（UKMO）</td><td class="num">+0.30</td><td class="num">0.84</td><td class="num">1.01</td><td class="num">0.97</td></tr>
+<tr><td>ECMWF IFS 0.25°</td><td class="num">+1.06</td><td class="num">1.16</td><td class="num">1.41</td><td class="num">0.94</td></tr>
+<tr><td><b>7 模型等权融合 + 偏差修正</b></td><td class="num">+0.00</td><td class="num"><b>0.62</b></td><td class="num"><b>0.79</b></td><td class="num"><b>0.80</b></td></tr>
+<tr><td>只用气候季节均值（对照）</td><td class="num">−0.69</td><td class="num">1.82</td><td class="num">2.30</td><td class="num">2.21（r=0.04，几乎无预测力）</td></tr>
+</table>
+<p>偏差修正后 RMSE 只有 <span class="big">0.79 °C</span>——已经很接近香港天文台官方预报的水平（实测官方 9 天预报
+与该方法几乎重合）。<b>但重点来了：</b></p>
+
+<div class="box bad">
+<b>即使你能完美预知当天的期望最高温，命中那个整数档的概率也只有 ~31%。</b><br>
+回测里"预测值取整天数 = 实际结算档"的命中率：<span style="font-size:22px;color:#f85149;font-weight:600">31%</span>
+（n=87，提前 0–1 天）。理论值（误差 ~N(0, 0.80)）为 39.6%。
+</div>
+
+<h3>为什么？因为"四舍五入"和"向下取整"打架</h3>
+<p>官方预报是<b>整数（四舍五入）</b>，结算是 <code>floor</code>。当预测值是 32.6（官方报 33），实际 32.9 落在
+<b>32 档</b>——相对官方档偏 −1。这造成实测偏移分布明显左偏：</p>
+<table>
+<tr><th>实际结算档 − 官方预报档</th><th class="num">实测频率</th><th></th></tr>
+<tr><td>−2 档及以下</td><td class="num">10.3%</td><td></td></tr>
+<tr><td><b>−1 档</b></td><td class="num"><b>43.7%</b></td><td><span class="tag">最容易买错的地方</span></td></tr>
+<tr><td>0 档（市场定价档）</td><td class="num">31.0%</td><td></td></tr>
+<tr><td>+1 档</td><td class="num">14.9%</td><td></td></tr>
+</table>
+<div class="box key"><b>可直接执行的推论：</b>如果某个档的市场价被推到 50–70%（散户看到官方预报写 33 就一窝蜂买 33），
+而你的集合分布告诉你它只有 30–35%，那么<b>买 NO（或卖空该档）的期望值极高</b>：
+市场价 50% vs 真实 31% → 买 NO 每 $1 收回约 $1.38。<br>
+反之，紧邻的 −1 档（43.7% 的偏移概率）常被严重低估。</div>
+
+<h2>3 · Edge ③：时区与流动性 —— 你人在这里，就是优势</h2>
+<ul>
+<li><b>香港白天 = 美东深夜。</b>欧美做市商睡觉时，香港气温盘的挂单变薄、价差拉宽、错误定价停留更久。你在办公室刷一下手机就能捡。</li>
+<li><b>结算数据发布有时间差。</b>天文台 CLMMAXT 通常滞后数天才定稿（此刻最新到 2026-08-31），而实时逐时观测（<code>rhrread</code> API）是每小时更新的。
+当天下午你用实时数据几乎已知答案，但要等官方定稿才结算——<b>中间那段"你已经知道、市场还没完全收敛"的窗口，就是你的 alpha</b>。</li>
+<li><b>日最高温出现时刻有规律但也有例外。</b>晴天峰值集中在 14:00–16:00，之后基本锁定；
+但阴雨 / 暖湿平流时峰值可能出现在<b>夜间</b>（暖空气夜间输送），市场仍按晴天逻辑定价——这是最典型的定价错误。</li>
+<li><b>台风是最大非线性。</b>天文台挂波前后，官方预报会大幅跳变，市场反应滞后数小时。台风季（7–9 月）edge 最大也最危险。</li>
+</ul>
+
+<h2>4 · Edge ④：微观结构</h2>
+<ul>
+<li><b>用限价单做 maker。</b>Polymarket 大部分品类 maker 零手续费甚至有返佣，taker 有费用。薄盘市场里，挂单比吃单每年省下几个百分点。</li>
+<li><b>跨档梯度下注（ladder）。</b>别梭哈一个档。把资金铺在你的分布支撑的 2–3 个相邻档上，收割分布形状而不是猜单点。</li>
+<li><b>Kelly：</b>二元合约买 YES 的最优仓位 <code>f* = (p − m) / (1 − m)</code>，其中 p = 你的公允概率，m = 市场价。
+实践中用 1/4 ~ 1/2 Kelly——你的 p 本身有模型误差。</li>
+<li><b>只在 |edge| &gt; 8% 时出手。</b>0.79 °C 的 RMSE 意味着你的概率估计本身有 ±5% 量级的不确定性，太小的 edge 会被自己的误差吃掉。</li>
+</ul>
+
+<h2>5 · 工具：把上面全部自动化</h2>
+<p>仓库里这个脚本把所有步骤串起来了（数据全部来自公开免费 API，无需 key）：</p>
+<pre><span class="kbd">cd /workspace/hk_weather_edge</span>
+
+# 未来 7 天所有档位的公允概率
+python3 hk_edge.py
+
+# 只看某一天 + 手工喂入市场价，直接算 edge
+python3 hk_edge.py --date 2026-09-08 --market "31:0.45,32:0.32,33:0.10"
+
+# 当日实时追踪（建议 cron 每 10 分钟跑一次，自动累计当日最高温）
+python3 hk_edge.py --watch
+
+# 生成 HTML 报告
+python3 hk_edge.py --html</pre>
+<p><b>数据流：</b></p>
+<table>
+<tr><th>用途</th><th>来源</th></tr>
+<tr><td>结算源历史（回测/校准）</td><td>HKO Open Data <code>CLMMAXT&amp;station=HKO</code></td></tr>
+<tr><td>实时各站温度（含天文台站）</td><td>HKO <code>rhrread</code>（每小时更新）</td></tr>
+<tr><td>官方锚（市场看的就是它）</td><td>HKO <code>fnd</code> 九天预报 <code>forecastMaxtemp</code></td></tr>
+<tr><td>多模型确定性融合</td><td>Open-Meteo：ECMWF IFS / GFS / ICON / GEM / METNO / JMA / UKMO</td></tr>
+<tr><td>概率分布</td><td>Open-Meteo Ensemble（ECMWF 50 成员）+ 偏差修正 + 残差平滑</td></tr>
+</table>
+<p>核心算法是气象学里标准的 <b>dressed ensemble</b>：把 50 个集合成员各自加上偏差修正，再叠加回测残差噪声
+N(0, 0.78)，然后对 <code>[N, N+1)</code> 积分求平均。这样得到的分布会随提前期自动变宽——
+提前 6 天很散，当天下午很尖，正好对应不确定性衰减。</p>
+
+<h2>6 · 天文台站日最高温气候基线（2016–2026）</h2>
+<table><tr><th>月份</th><th class='num'>均值 °C</th><th class='num'>日际 sd</th><th>月份</th><th class='num'>均值 °C</th><th class='num'>日际 sd</th></tr><tr><td>1月</td><td class='num'>19.81</td><td class='num'>2.93</td><td>7月</td><td class='num'>32.37</td><td class='num'>1.92</td></tr><tr><td>2月</td><td class='num'>20.81</td><td class='num'>3.49</td><td>8月</td><td class='num'>31.81</td><td class='num'>1.96</td></tr><tr><td>3月</td><td class='num'>23.56</td><td class='num'>3.42</td><td>9月</td><td class='num'>31.71</td><td class='num'>1.92</td></tr><tr><td>4月</td><td class='num'>26.83</td><td class='num'>2.86</td><td>10月</td><td class='num'>29.14</td><td class='num'>2.39</td></tr><tr><td>5月</td><td class='num'>29.42</td><td class='num'>2.92</td><td>11月</td><td class='num'>25.3</td><td class='num'>2.48</td></tr><tr><td>6月</td><td class='num'>31.51</td><td class='num'>1.87</td><td>12月</td><td class='num'>21.11</td><td class='num'>2.84</td></tr></table>
+<p>日际变化的 sd = <b>2.08 °C</b>——隔天气温波动很大，<code>|Δ| ≤ 1°C</code> 只占 45%。
+这意味着"昨天 33 今天也 33"的直觉基本没有信息量，<b>必须</b>用模式而不是趋势外推。</p>
+
+<h2>7 · 每日工作流（15 分钟）</h2>
+<ol>
+<li><b>14:00 HKT</b>：天文台更新九天预报后，跑 <code>python3 hk_edge.py</code>，看未来 4 天各档公允概率。</li>
+<li>打开 Polymarket 对应日期，把各档价格抄进 <code>--market</code>，让脚本标出 +EV 的档。</li>
+<li><b>只在 |edge| &gt; 8% 的档挂限价单</b>，做 maker，别吃单。</li>
+<li><b>09:00–16:00 HKT</b>：cron 每 10 分钟跑 <code>--watch</code>，实时知道天文台站今日已观测最高温。</li>
+<li>晴天 16:00 后峰值基本锁定 → 果断平仓或加仓；阴雨天保持警惕，峰值可能出现在夜里。</li>
+<li>记录每笔的"你的概率 vs 市场价 vs 结果"，30 笔后回头校准自己的命中率。</li>
+</ol>
+
+<h2>8 · 风险与合规（认真读）</h2>
+<div class="box bad">
+<ul>
+<li><b>合规：</b>香港《赌博条例》(Cap. 148) 下，预测市场处于灰色地带——未被明确许可，也未见针对此类平台的执法。
+SFC 未就预测市场表态。<b>这不构成法律意见，请自行评估，或咨询香港律师。</b></li>
+<li><b>模型风险：</b>0.79 °C 的 RMSE 在档位边界上就是真金白银。回测窗口只有 92 天（2026-06-06 起），
+样本偏夏季，冬季表现需要你自己积累数据后再校准。</li>
+<li><b>流动性风险：</b>香港气温盘单日成交量在 $0.1M–$0.25M 量级，冷门档位可能根本没人接你的单。</li>
+<li><b>结算风险：</b>规则写明"初始发布后的修订不予考虑"，但天文台确实偶有数据质量修订； disputed 结算会进 UMA 仲裁。</li>
+<li><b>别用 VPN 绕过地区限制</b>——违反 ToS 且可能被封号冻结资金。</li>
+</ul>
+</div>
+
+<footer>
+数据来源：香港天文台开放数据 API（CLMMAXT / rhrread / fnd）、Open-Meteo（多模式预报与 ECMWF 集合）。
+回测窗口 2026-06-06 ~ 2026-09-06，n=87；站点偏差样本 2016–2026。
+本文档为方法论研究，不构成投资建议。
+</footer>
+</div></body></html>

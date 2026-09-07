@@ -1,0 +1,20 @@
+# 生成的数据缓存 / 个人隐私留痕（不要提交）
+scripts/data/maxt_*.csv
+scripts/data/decision_log.csv
+scripts/data/intraday_log.json
+scripts/data/backtest_join.csv
+scripts/data/model_calib.json
+scripts/data/summary.json
+scripts/data/hitrate.json
+scripts/data/sens_*.json
+scripts/edge_report.html
+
+# 保留：scripts/data/diurnal_climatology.json（重算需数分钟，开箱即用）
+
+__pycache__/
+*.pyc
+.DS_Store
+venv/
+.venv/
+watch.log
+*.log
