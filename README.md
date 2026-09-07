@@ -1,5 +1,7 @@
 # hk-weather-edge
 
+> 当前版本 **v0.5.0** —— 每次更新的改动见 [CHANGELOG.md](CHANGELOG.md)。
+
 CodeBuddy / Claude 技能包：Polymarket「香港最高气温」日度市场的 **edge 计算与实况外推**。
 
 把香港天文台（HKO）开放数据 + Open-Meteo 多模式 NWP 集合，转成校准后的**摄氏整数档（bucket）公允概率**，

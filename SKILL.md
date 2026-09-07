@@ -1,5 +1,6 @@
 ---
 name: hk-weather-edge
+version: 0.5.0
 description: Polymarket「香港最高气温」日度市场的 edge 计算与实况外推工具。把香港天文台(HKO)开放数据 + Open-Meteo 多模式 NWP 集合转为校准后的摄氏整数档(bucket)公允概率，并与市场价对比输出 EV 与 1/4 Kelly 仓位建议；`--watch` 模式基于结算站实测 + 日内气候曲线做当日峰值 nowcast。当用户提到「香港气温市场」「最高气温预测」「HKO / 天文台结算」「bucket 概率」「temperature bucket edge」「今天香港会到几度」「 polymarket weather Hong Kong」，或需要判断某个整数档是否值得买 YES / NO 时使用。
 ---
 
@@ -225,6 +226,23 @@ py -3 scripts/fetch_stations.py     # 下载 KP(京士柏)/TKL(打鼓岭)/SEK(�
 - 事前概率随提前期自动变宽：提前 6 天很散，当天下午很尖。别用同一套仓位标准对待不同提前期。
 
 **两条独立路径交叉验证**：自上而下（NWP 集合）与自下而上（`--watch` 实况外推）同时给峰值估计。两者一致时信心最高；分歧说明模型没吃进最新实况——此时应下调仓位而不是挑一边下注。
+
+## 发版流程（每次推送 GitHub 前必做）
+
+用户的要求：**每次更新到 GitHub 都要更新版本号，并简述最新版本的改动**。固定四步：
+
+1. **定版本号**（语义化 `MAJOR.MINOR.PATCH`，规则见 `CHANGELOG.md` 顶部）
+   - 只改文档 / 性能 / 修 bug 且**任何输出数字都不变** → PATCH
+   - 新增功能或参数（向后兼容）→ MINOR
+   - 结算口径、档位定义、核心算法改变 → MAJOR
+2. **同步三处版本号**（漏一处就会自相矛盾）
+   - `scripts/hk_edge.py` 的 `VERSION` 常量（`--version` 读它）
+   - `SKILL.md` frontmatter 的 `version:`
+   - `README.md` 顶部的「当前版本」行
+3. **在 `CHANGELOG.md` 顶部加一条**：日期 + 一句话主题 + 要点（改了什么、为什么、
+   **有没有改变输出数字**）。若数字会变，必须写明验证方式（例："优化前后逐位比对，最大差 0.00e+00"）。
+4. **提交并推送**：提交信息带版本号（`Release v0.5.0: ...`）；推完核对
+   本地 `git rev-parse --short HEAD` 与远端 `gh api repos/easonyeung1122-ops/hk-weather-edge/commits/main --jq .sha` 一致。
 
 ## 合规与免责
 

@@ -24,6 +24,8 @@ Polymarket「香港最高气温」市场 Edge 计算器
 import argparse, json, math, os, sys, time, datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 
+VERSION = "0.5.0"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
+
 # ---- HTTP 层 ----
 # 一次运行要打 3~4 个互不依赖的接口，串行时耗时几乎全是 TLS 握手（实测 2.2s ≈ 3×0.7s）。
 # 三层加速，都不改变任何数字：
@@ -396,6 +398,7 @@ def main():
                          f'实况与价格永不缓存）')
     ap.add_argument('--no-cache', action='store_true', help='强制实时拉取，绕过缓存')
     ap.add_argument('--html', action='store_true', help='额外输出 HTML 报告')
+    ap.add_argument('--version', action='version', version=f'hk-weather-edge {VERSION}')
     a = ap.parse_args()
 
     if a.watch:
