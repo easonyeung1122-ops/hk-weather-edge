@@ -52,6 +52,20 @@ py -3 scripts/hk_edge.py --date 2026-09-07 --observed-max 30.0 --mu 30.15 --sigm
 ⚠️ Polymarket 规则会变（换过巴黎的结算站点、把深圳切到 NOAA），每次下单前重读 Rules。
 ⚠️ 与美国城市盘不同：香港是**摄氏 0.1 位**，勿照搬华氏整数那套经验。
 
+## 取价：用订单簿，不要用最后成交价
+
+Gamma 的 `outcomePrices`（最后成交价）和 `bestBid/bestAsk` 都是**延迟指标**，只有 CLOB 订单簿实时。
+实测同一时刻（临近结算时）30 档：最后成交 0.82、Gamma 0.79/0.85、**订单簿 0.962/0.988** —— 差 15 分以上，
+用最后成交价算出的 EV 完全是假的。
+
+```bash
+py -3 scripts/market_prices.py 2026-09-07            # 按香港日期取盘口
+py -3 scripts/market_prices.py 2026-09-08 --depth 3  # 多看几档深度
+```
+
+算 EV 用可执行价：买 YES 用 YES 的 **ask**，买 NO 用 **NO token 自己的 ask**（NO 有独立订单簿）。
+算完 Kelly 后**必须核对可成交量**——临近结算常出现「EV +150% 但只能买 165 份」的情况。
+
 ## 三条 edge 来源
 
 1. **结算只认一个传感器**——市场看的是"香港天气"这个模糊概念
@@ -66,6 +80,7 @@ SKILL.md                              技能主指令
 references/methodology.md             实证数据 / dressed ensemble 公式 / 数据源 / 排障
 assets/docs_edge_map.html             完整方法论报告（浏览器可直接打开）
 scripts/hk_edge.py                    主程序
+scripts/market_prices.py              从 CLOB 订单簿取真实可成交价（取价必用）
 scripts/diurnal.py                    生成日内气候升温表（ERA5）
 scripts/fetch_stations.py             下载多站历史 CSV（供 analyze.py）
 scripts/backtest.py / analyze.py / hitrate.py   校准与分析（需 pandas + numpy）
