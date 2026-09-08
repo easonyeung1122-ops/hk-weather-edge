@@ -26,7 +26,7 @@ Polymarket「香港最高气温」市场 Edge 计算器
 import argparse, json, math, os, sys, time, datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "0.8.0"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
+VERSION = "0.9.0"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
 
 # Kelly 缩放：满 Kelly 波动太大、且概率本身有 ±5% 量级误差，实操一律打折。
 # 这里用 35% Kelly（原来是 1/4=25%）。
@@ -111,7 +111,7 @@ OM_ENS    = ("https://ensemble-api.open-meteo.com/v1/ensemble?latitude={lat}&lon
 OM_PREV   = ("https://previous-runs-api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
              "&daily=temperature_2m_max&past_days=92&forecast_days=1&timezone=Asia%2FShanghai&models={m}")
 OM_HR     = ("https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
-             "&hourly=temperature_2m&forecast_days=1&past_hours=3"
+             "&hourly=temperature_2m&forecast_days=1&past_hours={ph}"
              "&timezone=Asia%2FShanghai&models=best_match")
 
 
@@ -277,10 +277,13 @@ def bucket_probs(target, det, ens, calib, mu_override=None, floor=None, sd_overr
 # ---------------------------------------------------------------- 当日实时追踪
 def watch():
     """实时追踪：记录当日天文台站已观测到的最高温度（供 cron 每 10 分钟调用）"""
+    now = dt.datetime.now(TZ)
     # 观测与网格实况互不依赖 → 并行拉取（两者都属实况，永不缓存）
+    # past_hours 拉到今天 0 时：没采样到的小时要靠网格回填（见下方"回填未采样"）
     ex = ThreadPoolExecutor(max_workers=2)
     f_rhr = ex.submit(_get, HKO_RHR, 30)
-    f_grid = ex.submit(_get, OM_HR.format(lat=OBS_LAT, lon=OBS_LON), 30)
+    f_grid = ex.submit(_get, OM_HR.format(lat=OBS_LAT, lon=OBS_LON,
+                                         ph=max(3, now.hour + 1)), 30)
     try:
         r = f_rhr.result()
     except Exception as e:
@@ -300,29 +303,68 @@ def watch():
 
     pts = [p for p in log['points'] if p['hko'] is not None]
     mx = max(p['hko'] for p in pts) if pts else None
+    sampled_h = {int(p['t'][11:13]) for p in pts}
     others = {k: v for k, v in temp.items() if k != 'Hong Kong Observatory'}
     hot = sorted(others.items(), key=lambda x: -x[1])[:5]
+    try:
+        obs_h = int(rt[11:13])          # 观测时刻——所有小时内推算都以它为基准
+    except (TypeError, ValueError):
+        obs_h = now.hour
     print(f"\n香港时间 {rt[11:16]}  天文台站 {hko_t}°C   今日已观测最高 {mx}°C  (样本 {len(pts)})")
+    if hko_t is not None and now.hour > obs_h:
+        print(f"  ⚠ 天文台观测滞后 {now.hour - obs_h} 小时（最新记录 {rt[11:16]}），"
+              f"以下推算全部以观测时刻为基准")
     print(f"  全港最热: " + ", ".join(f"{k} {v}°C" for k, v in hot))
     print(f"  相对天文台: " + ", ".join(f"{k} {v - hko_t:+.0f}" for k, v in hot if hko_t))
     if hko_t is not None and mx is not None:
         print(f"\n  → 结算档位若现在定格: {int(math.floor(mx))}°C  "
               f"(实测 {mx}°C 落在 [{int(math.floor(mx))}.0, {int(math.floor(mx)) + 1}.0))")
-    now = dt.datetime.now(TZ)
+    intraday_mx = mx      # 回填后的估计（下面算出来），用于概率下限与过峰守卫
     # ---- 日内外推：当前实测 + 气候升温幅度 + 站点加成 ----
     try:
         calib = json.load(open(os.path.join(DATA, 'model_calib.json')))
         diur = json.load(open(os.path.join(DATA, 'diurnal_climatology.json')))
-        hh = now.hour
+        hh = obs_h       # 以"观测时刻"为基准，不是"现在"——两者不一致时若用现在，
+                         # 会拿上一小时的实测去比对下一小时的网格，凭空造出偏差
         if str(now.month) in diur and str(hh) in diur[str(now.month)]:
             d = diur[str(now.month)][str(hh)]
             oh = f_grid.result()['hourly']      # 上面已并行发起，这里取结果
             grid_now = None
+            grid_by_h = {}
             for t, v in zip(oh['time'], oh['temperature_2m']):
-                if t.startswith(today) and int(t[11:13]) == hh:
+                if not t.startswith(today) or v is None:
+                    continue
+                try:
+                    h = int(t[11:13])
+                except ValueError:
+                    continue
+                grid_by_h[h] = float(v)
+                if h == hh:
                     grid_now = v
             if grid_now is not None and hko_t is not None:
-                cur_bias = hko_t - grid_now                 # 此刻 实测−网格
+                cur_bias = hko_t - grid_now                 # 观测时刻的 实测−网格
+                # —— 回填未采样的观测 ——
+                # 「今日已观测最高」原本取自身轮询记录的最大值：一旦漏点就会系统性
+                # 低估当日真实最高（2026-09-08 就漏掉了 12、13 时整点）。而它既是
+                # 各档位的概率下限，也是「已过峰值守卫」的触发条件——低估等于让模型
+                # 以为"还能再升"。这里用今天的站点偏差把网格逐时值翻译成站点估计，
+                # 只回填没有实测样本的小时，有实测的永远以实测为准。
+                # 回填偏差**封顶在气候值**：单点偏差今天能在 1 小时内摆 ±1.3°C
+                # （09-08：15时 +0.3 → 16时 +1.7），直接拿它去外推没采样的小时，
+                # 会凭空宣称"中午已经到过 33.1°C"。宁可低估（有实测兜底），不可高估。
+                fill_bias = min(cur_bias, calib['bias'])
+                mx_rec = mx
+                if mx is not None:
+                    for h in sorted(grid_by_h):
+                        if h > hh or h in sampled_h:
+                            continue
+                        est = round(grid_by_h[h] + fill_bias, 1)
+                        if est > mx_rec:
+                            mx_rec = est
+                if mx is not None and mx_rec > mx + 1e-9:
+                    intraday_mx = mx_rec
+                    print(f"     ⓘ 观测有漏点，已按偏差{fill_bias:+.2f}回填未采样时段："
+                          f"已观测最高 {mx}°C → {mx_rec:.1f}°C（测站在其间可能已达此值）")
                 k = calib['bias'] - cur_bias                # 站点升温加成
                 # —— 已过峰值守卫 ——
                 # 气候表 d['mean'] = 平均而言"还能升多少"，它是无条件统计：既包含
@@ -331,7 +373,7 @@ def watch():
                 # 当日峰值大概率已定格——无条件期望必须大幅收窄，只留少量
                 # "晚些反弹创出新高"的可能。这正是"外推低于已实测最高"这族问题
                 # 的另一面：前者发生在早上(网格还没到过那么高)，后者在下午(已经到过)。
-                g = float(mx - hko_t) if mx is not None else 0.0
+                g = float(intraday_mx - hko_t) if intraday_mx is not None else 0.0
                 post = g >= 0.3 and hh >= 14
                 if post:
                     s_hour = min(1.0, max(0.0, (hh - 14) / 2.0))   # 14时→0, 16时→1
@@ -345,11 +387,11 @@ def watch():
                     rise_m = d['mean'] + k
                     rise_sd = d['sd']
                 peak_raw = hko_t + rise_m
-                if mx is not None and peak_raw < mx:
+                if intraday_mx is not None and peak_raw < intraday_mx:
                     if not post:
-                        print(f"\n  ⚠ 外推 {peak_raw:.2f}°C 低于今日已观测最高 {mx}°C，"
+                        print(f"\n  ⚠ 外推 {peak_raw:.2f}°C 低于今日已观测最高 {intraday_mx}°C，"
                               f"已按已观测值取下限（日内最高具有单调性）")
-                    peak = float(mx)
+                    peak = float(intraday_mx)
                 else:
                     peak = peak_raw
                 print(f"\n  📈 日内外推（气候基准 n={d['n']}）")
@@ -365,8 +407,12 @@ def watch():
                       f"区间[{peak - rise_sd:.1f}, {peak + rise_sd:.1f}]  "
                       f"→ 众数档 {int(math.floor(peak))}°C")
                 for b in range(int(math.floor(peak)) - 1, int(math.floor(peak)) + 3):
-                    need = b - hko_t
-                    if mx is not None and b <= mx:
+                    # 基准 = 今日已实测到的最高值：守卫里的 net = gross - g 本来就是
+                    # "在已观测最高之上还能再升多少"，若仍从当前(已回落的)读数起算，
+                    # 等于把同一段回落罚了两次。
+                    base = hko_t if intraday_mx is None else max(hko_t, intraday_mx)
+                    need = b - base
+                    if intraday_mx is not None and b <= intraday_mx:
                         prob = 1.0   # 今日已实测到该温度，达成概率为 100%
                     elif rise_sd > 0:
                         z = (need - rise_m) / rise_sd
