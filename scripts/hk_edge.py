@@ -24,7 +24,7 @@ Polymarket「香港最高气温」市场 Edge 计算器
 import argparse, json, math, os, sys, time, datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "0.5.0"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
+VERSION = "0.6.0"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
 
 # ---- HTTP 层 ----
 # 一次运行要打 3~4 个互不依赖的接口，串行时耗时几乎全是 TLS 握手（实测 2.2s ≈ 3×0.7s）。
@@ -464,14 +464,14 @@ def main():
               f"| 集合离散度 ±{r['spread']:.2f}°C  残差sd {r['sd']:.2f}"
               f"  | HKO官方预报 {hko_map.get(t, '?')}°C{ftag}")
         hdr = f"  {'档位':>6} {'公允P':>8} {'市场价':>8} {'动作':>14} {'EV':>7}"
-        hdr += f" {'1/4Kelly下注':>12}"   # 始终给出：有 edge 就必须给出 1/4 Kelly 仓位
+        hdr += f" {'1/4Kelly(金额/份数)':>22}"   # 始终给出：有 edge 就必须给出 1/4 Kelly 仓位
         print(hdr + "   分布条")
         for b, p in sorted(r['probs'].items()):
             bar = '█' * int(round(p * 50))
             mk = market.get(b)
             if mk is None:
                 line = f"  {b:>4}°C {p:>7.1%} {'-':>8} {'-':>14} {'-':>7}"
-                line += f" {'-':>12}"
+                line += f" {'-':>22}"
                 print(line + f"   {bar}")
                 continue
             ev_buy = p / mk - 1
@@ -491,12 +491,21 @@ def main():
             else:
                 kf = 0
             stake = max(0.0, kf) * bankroll * 0.25
-            line += f" {'$' + format(stake, '.0f') + f' ({max(0.0, kf) * 25:.1f}%)':>16}" \
-                if stake >= 1 else f" {'-':>16}"
+            # 金额之外必须给份数：下单界面要填的是份数，不是美元
+            if stake >= 1 and side is not None:
+                unit = mk if side == 'yes' else (1 - mk)      # 该方向的单价
+                shares = stake / unit if unit > 0 else 0.0
+                cell = f"${stake:.0f} / {shares:.0f}份 ({max(0.0, kf) * 25:.1f}%)"
+            else:
+                cell = '-'
+            line += f" {cell:>22}"
             print(line + f"   {bar}")
         top = max(r['probs'].items(), key=lambda x: x[1])
         print(f"  → 众数档 {top[0]}°C 仅 {top[1]:.1%}: 即使完美预测期望值,"
               f"命中整数档的概率也不到一半 —— 别把点预报当概率")
+    if market:
+        print("\n  份数 = 建议金额 ÷ 该档单价（买 YES 用市场价 mk，买 NO 用 1−mk）；"
+              "下单前按订单簿可执行价重算一次（见 A0）——单价差 1 分钱，份数会差不少。")
 
     # 决策留痕：攒够 30 笔就能回头校准自己的命中率（长期真正的 edge 来源）
     if market:
