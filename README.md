@@ -1,11 +1,11 @@
 # hk-weather-edge
 
-> 当前版本 **v0.7.0** —— 每次更新的改动见 [CHANGELOG.md](CHANGELOG.md)。
+> 当前版本 **v0.8.0** —— 每次更新的改动见 [CHANGELOG.md](CHANGELOG.md)。
 
 CodeBuddy / Claude 技能包：Polymarket「香港最高气温」日度市场的 **edge 计算与实况外推**。
 
 把香港天文台（HKO）开放数据 + Open-Meteo 多模式 NWP 集合，转成校准后的**摄氏整数档（bucket）公允概率**，
-与市场价对比后输出 EV 与 1/4 Kelly 仓位建议；`--watch` 模式基于**结算站实测 + 日内气候曲线**外推当日峰值。
+与市场价对比后输出 EV 与 **35% Kelly** 仓位建议（金额 + 份数）；`--watch` 模式基于**结算站实测 + 日内气候曲线**外推当日峰值。
 
 > 方法论研究，**不构成投资建议**。香港《赌博条例》(Cap. 148) 下预测市场属灰色地带，请自行评估合规风险。
 > 不要用 VPN 绕过地区限制（违反 Polymarket ToS，可能冻结资金）。
@@ -25,7 +25,7 @@ git clone https://github.com/easonyeung1122-ops/hk-weather-edge.git ~/.codebuddy
 ```bash
 py -3 scripts/hk_edge.py                                # 未来 7 天各档公允概率
 py -3 scripts/hk_edge.py --date 2026-09-09 --bankroll 500 \
-  --market "29:0.12,30:0.30,31:0.42,32:0.11,33:0.03"    # 算 edge + 1/4 Kelly
+  --market "29:0.12,30:0.30,31:0.42,32:0.11,33:0.03"    # 算 edge + 35% Kelly
 py -3 scripts/hk_edge.py --watch                        # 当日实况追踪（建议每 10 分钟）
 ```
 

@@ -1,7 +1,7 @@
 ---
 name: hk-weather-edge
-version: 0.7.0
-description: Polymarket「香港最高气温」日度市场的 edge 计算与实况外推工具。把香港天文台(HKO)开放数据 + Open-Meteo 多模式 NWP 集合转为校准后的摄氏整数档(bucket)公允概率，并与市场价对比输出 EV 与 1/4 Kelly 仓位建议；`--watch` 模式基于结算站实测 + 日内气候曲线做当日峰值 nowcast。当用户提到「香港气温市场」「最高气温预测」「HKO / 天文台结算」「bucket 概率」「temperature bucket edge」「今天香港会到几度」「 polymarket weather Hong Kong」，或需要判断某个整数档是否值得买 YES / NO 时使用。
+version: 0.8.0
+description: Polymarket「香港最高气温」日度市场的 edge 计算与实况外推工具。把香港天文台(HKO)开放数据 + Open-Meteo 多模式 NWP 集合转为校准后的摄氏整数档(bucket)公允概率，并与市场价对比输出 EV 与 35% Kelly 仓位建议；`--watch` 模式基于结算站实测 + 日内气候曲线做当日峰值 nowcast。当用户提到「香港气温市场」「最高气温预测」「HKO / 天文台结算」「bucket 概率」「temperature bucket edge」「今天香港会到几度」「 polymarket weather Hong Kong」，或需要判断某个整数档是否值得买 YES / NO 时使用。
 ---
 
 # 香港气温市场 Edge 工具
@@ -9,7 +9,7 @@ description: Polymarket「香港最高气温」日度市场的 edge 计算与实
 ## 目的
 
 把公开气象数据转换成**可与市场价对比的整数档概率**，用于 Polymarket「Highest temperature in Hong Kong」日度市场。
-产出三样东西：每个整数档的公允概率、相对市场价的 EV 与动作（买 YES / 买 NO / 观望）、可选的 1/4 Kelly 下注额。
+产出三样东西：每个整数档的公允概率、相对市场价的 EV 与动作（买 YES / 买 NO / 观望）、**35% Kelly 下注额（金额 + 份数）**。
 
 ## 核心认知（决定这个工具有没有用）
 
@@ -90,7 +90,7 @@ py -3 scripts/market_prices.py 2026-09-08 --depth 3  # 多看几档深度
 # 1) 未来 7 天各档公允概率
 py -3 scripts/hk_edge.py
 
-# 2) 指定日期 + 喂入市场价 + 本金，输出 EV 与 1/4 Kelly 下注额
+# 2) 指定日期 + 喂入市场价 + 本金，输出 EV 与 35% Kelly 下注额
 py -3 scripts/hk_edge.py --date 2026-09-09 --bankroll 500 \
   --market "29:0.12,30:0.30,31:0.42,32:0.11,33:0.03"
 
@@ -110,7 +110,7 @@ py -3 scripts/hk_edge.py --date 2026-09-08 --bankroll 1400 \
   --hold "34:0.065:200,33:0.56:70:N"
 ```
 
-输出里每档给出：公允 P、市场价、动作、EV、**1/4 Kelly 的金额与建议份数**、**止盈警告 ⚠**、分布条。
+输出里每档给出：公允 P、市场价、动作、EV、**35% Kelly 的金额与建议份数**、**止盈警告 ⚠**、分布条。
 底部固定提示一句"众数档仅 xx%——别把点预报当概率"，这是给持有仓位时的心理锚。
 
 ### A2. 当日（提前 0 天）必须做的两件事
@@ -209,8 +209,9 @@ py -3 scripts/fetch_stations.py     # 下载 KP(京士柏)/TKL(打鼓岭)/SEK(�
 - **EV 必须用订单簿可执行价算**（见 A0），用最后成交价算出的 edge 是假的。
 - **挂限价单做 maker**，别吃单，taker 费用会吃掉薄盘的 edge。
 - **跨 2–3 个相邻档 ladder**，收割分布形状而不是猜单点。
-- **只要判定有 edge（|EV| > 8%），就必须给出 1/4 Kelly 仓位建议**——不能只说"买 YES"就收尾。
-  买 YES `f* = (p−m)/(1−m)`，买 NO `f* = (m−p)/m`，实操一律 1/4 Kelly。
+- **只要判定有 edge（|EV| > 8%），就必须给出 Kelly 仓位建议**——不能只说"买 YES"就收尾。
+  买 YES `f* = (p−m)/(1−m)`，买 NO `f* = (m−p)/m`，**实操一律 35% Kelly**
+  （脚本常量 `KELLY_FRAC = 0.35`；满 Kelly 波动过大，且概率本身有 ±5% 量级误差）。
   用户未给本金时**默认按 1000 USDC 估算，并明确标注这是假设**（脚本同样行为，`--bankroll` 覆盖）。
   **输出必须是三件套：金额 + 建议份数 + 占本金百分比**——只给金额等于没给，下单界面填的是份数。
   份数 = 金额 ÷ 该档单价（买 YES 用市场价 `m`，买 NO 用 `1−m`）；最后用**订单簿可执行价**复核一遍，

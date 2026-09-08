@@ -26,7 +26,11 @@ Polymarket「香港最高气温」市场 Edge 计算器
 import argparse, json, math, os, sys, time, datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "0.7.0"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
+VERSION = "0.8.0"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
+
+# Kelly 缩放：满 Kelly 波动太大、且概率本身有 ±5% 量级误差，实操一律打折。
+# 这里用 35% Kelly（原来是 1/4=25%）。
+KELLY_FRAC = 0.35
 
 # ---- HTTP 层 ----
 # 一次运行要打 3~4 个互不依赖的接口，串行时耗时几乎全是 TLS 握手（实测 2.2s ≈ 3×0.7s）。
@@ -387,7 +391,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--date', help='目标日期 YYYY-MM-DD（香港日期）')
     ap.add_argument('--market', help='市场价，格式 "31:0.42,32:0.35"')
-    ap.add_argument('--bankroll', type=float, help='本金(USDC)，给出 1/4 Kelly 建议下注额')
+    ap.add_argument('--bankroll', type=float,
+                    help=f'本金(USDC)，给出 {KELLY_FRAC:.0%} Kelly 建议下注额')
     ap.add_argument('--mu', type=float, help='手动覆盖点估计(°C)：把日内实况/官方预报按你的判断加权')
     ap.add_argument('--observed-max', type=float,
                     help='当日已实测到的最高温(°C)：分布截断重命名到该下限（默认自动读 --watch 日志）')
@@ -452,10 +457,11 @@ def main():
             k, v = kv.split(':')
             market[int(k)] = float(v)
 
-    # 有 edge 就必须给出 1/4 Kelly 仓位；未指定本金时按 1000 USDC 估算并明确标注
+    # 有 edge 就必须给出 Kelly 仓位；未指定本金时按 1000 USDC 估算并明确标注
     bankroll = a.bankroll if a.bankroll else 1000.0
     if not a.bankroll:
-        print(f"本金未指定 → 默认按 {bankroll:.0f} USDC 估算 1/4 Kelly 下注额（用 --bankroll 覆盖）")
+        print(f"本金未指定 → 默认按 {bankroll:.0f} USDC 估算 {KELLY_FRAC:.0%} Kelly "
+              f"下注额（用 --bankroll 覆盖）")
 
     results = {}
     for t in targets:
@@ -471,7 +477,7 @@ def main():
               f"| 集合离散度 ±{r['spread']:.2f}°C  残差sd {r['sd']:.2f}"
               f"  | HKO官方预报 {hko_map.get(t, '?')}°C{ftag}")
         hdr = f"  {'档位':>6} {'公允P':>8} {'市场价':>8} {'动作':>14} {'EV':>7}"
-        hdr += f" {'1/4Kelly(金额/份数)':>22}"   # 始终给出：有 edge 就必须给出 1/4 Kelly 仓位
+        hdr += f" {f'{KELLY_FRAC:.0%}Kelly(金额/份数)':>22}"   # 有 edge 就必须给出仓位
         print(hdr + "   分布条")
         for b, p in sorted(r['probs'].items()):
             bar = '█' * int(round(p * 50))
@@ -497,12 +503,13 @@ def main():
                 kf = (mk - p) / mk
             else:
                 kf = 0
-            stake = max(0.0, kf) * bankroll * 0.25
+            stake = max(0.0, kf) * bankroll * KELLY_FRAC
             # 金额之外必须给份数：下单界面要填的是份数，不是美元
             if stake >= 1 and side is not None:
                 unit = mk if side == 'yes' else (1 - mk)      # 该方向的单价
                 shares = stake / unit if unit > 0 else 0.0
-                cell = f"${stake:.0f} / {shares:.0f}份 ({max(0.0, kf) * 25:.1f}%)"
+                cell = (f"${stake:.0f} / {shares:.0f}份 "
+                        f"({max(0.0, kf) * KELLY_FRAC * 100:.1f}%)")
             else:
                 cell = '-'
             line += f" {cell:>22}"
