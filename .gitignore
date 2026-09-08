@@ -4,6 +4,7 @@ scripts/data/decision_log.csv
 scripts/data/intraday_log.json
 scripts/data/backtest_join.csv
 scripts/data/model_calib.json
+scripts/data/http_cache.json
 scripts/data/summary.json
 scripts/data/hitrate.json
 scripts/data/sens_*.json

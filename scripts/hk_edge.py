@@ -18,13 +18,15 @@ Polymarket「香港最高气温」市场 Edge 计算器
   python3 hk_edge.py --recalibrate        # 强制重算模型偏差
   python3 hk_edge.py --no-cache           # 强制实时拉取（下单前用它）
   python3 hk_edge.py --ttl 300            # 模式/预报缓存改为 5 分钟（默认 900）
+  python3 hk_edge.py --date 2026-09-08 --hold "34:0.065:200,33:0.56:70:N"
+                                          # 已用头寸的浮盈 + 该不该止盈
 
 依赖：pip3 install requests（没有也能跑，会回落到 urllib）
 """
 import argparse, json, math, os, sys, time, datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "0.6.0"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
+VERSION = "0.7.0"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
 
 # ---- HTTP 层 ----
 # 一次运行要打 3~4 个互不依赖的接口，串行时耗时几乎全是 TLS 握手（实测 2.2s ≈ 3×0.7s）。
@@ -391,6 +393,11 @@ def main():
                     help='当日已实测到的最高温(°C)：分布截断重命名到该下限（默认自动读 --watch 日志）')
     ap.add_argument('--sigma', type=float,
                     help='剩余总不确定性 sd(°C)，日内用：给出后不再叠加集合距平，直接用 N(mu, sigma)')
+    ap.add_argument('--exit-ev', type=float, default=0.15,
+                    help='止盈阈值：某方向"现在买入"的 EV ≤ 这个负值时打 ⚠'
+                         '（默认 -0.15，含义是市价已明显高于公允值，持有人该检查止盈）')
+    ap.add_argument('--hold', help='已持有头寸 "档位:成本价:份数[:Y|N],..."（N=持有 NO），'
+                                   '例 "34:0.065:200,33:0.56:70:N" → 输出浮盈与止盈建议')
     ap.add_argument('--watch', action='store_true', help='当日实时追踪')
     ap.add_argument('--recalibrate', action='store_true')
     ap.add_argument('--ttl', type=int, default=CACHE_TTL,
@@ -499,6 +506,15 @@ def main():
             else:
                 cell = '-'
             line += f" {cell:>22}"
+            # 反向 edge = 止盈信号：这个方向的 EV 很负，说明市价已明显高于公允值，
+            # 还拿着这个方向头寸的人应该考虑平仓，而不是继续持有到期。
+            warns = []
+            if ev_buy <= -a.exit_ev:
+                warns.append(f"⚠持YES止盈{ev_buy:.0%}")
+            if ev_sell <= -a.exit_ev:
+                warns.append(f"⚠持NO止盈{ev_sell:.0%}")
+            if warns:
+                line += "  " + " ".join(warns)
             print(line + f"   {bar}")
         top = max(r['probs'].items(), key=lambda x: x[1])
         print(f"  → 众数档 {top[0]}°C 仅 {top[1]:.1%}: 即使完美预测期望值,"
@@ -506,6 +522,46 @@ def main():
     if market:
         print("\n  份数 = 建议金额 ÷ 该档单价（买 YES 用市场价 mk，买 NO 用 1−mk）；"
               "下单前按订单簿可执行价重算一次（见 A0）——单价差 1 分钱，份数会差不少。")
+        print(f"  ⚠ 止盈提醒：某方向「现在买入」的 EV ≤ {-a.exit_ev:.0%} 时会打 ⚠，"
+              f"含义是市价已明显高于公允值 —— 持有该方向头寸者应检查止盈。")
+
+    # ---- 持仓检查：把已用头寸喂进来，直接算浮盈与该不该止盈 ----
+    if a.hold:
+        t0 = targets[-1]
+        r0 = results[t0]
+        print(f"\n■ 持仓检查 {t0}（止盈阈值：现在买入 EV ≤ {-a.exit_ev:.0%}）")
+        print(f"  {'头寸':>10} {'份数':>7} {'成本':>7} {'现价':>7} {'浮盈':>8} {'公允':>8} "
+              f"{'现在买入EV':>10}   建议")
+        for item in a.hold.split(','):
+            ps = [x for x in item.split(':') if x]
+            try:
+                b, ent, sh = int(ps[0]), float(ps[1]), float(ps[2])
+                side = (ps[3] if len(ps) > 3 else 'Y').upper()
+            except Exception:
+                print(f"  [跳过，格式应为 档位:成本:份数[:Y|N] -> {item}]")
+                continue
+            p = r0['probs'].get(b)
+            if p is None:
+                print(f"  {b}°C 不在公允分布内，跳过")
+                continue
+            fair = p if side != 'N' else 1 - p
+            mk = market.get(b)
+            if mk is None:
+                print(f"  {b}°C {'YES' if side != 'N' else 'NO '} {sh:.0f}份 @{ent:.3f}"
+                      f"   公允 {fair:.1%}（未给该档市场价，算不了浮盈）")
+                continue
+            cur = mk if side != 'N' else 1 - mk
+            pnl = (cur - ent) / ent if ent > 0 else 0.0
+            ev_now = fair / cur - 1 if cur > 0 else 0.0
+            if ev_now <= -a.exit_ev:
+                adv = f"⚠ 止盈（现价高出公允 {-ev_now:.0%}）"
+            elif ev_now >= 0.08:
+                adv = f"仍低估 {ev_now:.0%} → 持有/可加仓"
+            else:
+                adv = "持有观察（edge 不足）"
+            name = f"{b}°C {'YES' if side != 'N' else 'NO '}"
+            print(f"  {name:>10} {sh:>7.0f} {ent:>7.3f} {cur:>7.3f} {pnl:>+8.0%} "
+                  f"{fair:>8.1%} {ev_now:>+10.0%}   {adv}")
 
     # 决策留痕：攒够 30 笔就能回头校准自己的命中率（长期真正的 edge 来源）
     if market:
