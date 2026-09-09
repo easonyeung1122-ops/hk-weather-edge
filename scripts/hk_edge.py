@@ -26,7 +26,7 @@ Polymarket「香港最高气温」市场 Edge 计算器
 import argparse, json, math, os, sys, time, datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "0.10.0"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
+VERSION = "0.11.0"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
 
 # Kelly 缩放：满 Kelly 波动太大、且概率本身有 ±5% 量级误差，实操一律打折。
 # 这里用 35% Kelly（原来是 1/4=25%）。
@@ -209,16 +209,23 @@ def recalibrate(obs=None, force=False, use_cache=True, ttl=CACHE_TTL):
     return c
 
 
-def fetch_forecasts(use_cache=True, ttl=CACHE_TTL):
-    """多模型确定性融合 + ECMWF 集合 + HKO 官方预报（三个接口并行拉取）"""
+def fetch_forecasts(use_cache=True, ttl=CACHE_TTL, need_ens=True):
+    """多模型确定性融合 + ECMWF 集合 + HKO 官方预报（三个接口并行拉取）
+
+    need_ens=False 时跳过集合请求。这**只在 --sigma 给出时**才允许：那时概率
+    直接用 N(mu, sigma)，集合成员根本不进入计算（`draws=[mu]`），而集合恰好是
+    三个请求里最慢的一个（实测 1.5s，占冷启动大半）。跳过它不改变任何概率数字，
+    只是「集合离散度」显示为 n/a。
+    """
     _cache_load()          # 先把缓存读进内存，避免线程里重复读盘
     with ThreadPoolExecutor(max_workers=3) as ex:
         f_det = ex.submit(_get, OM_FC.format(lat=OBS_LAT, lon=OBS_LON, m=MODELS),
                           60, use_cache, ttl)
-        f_ens = ex.submit(_get, OM_ENS.format(lat=OBS_LAT, lon=OBS_LON), 60, use_cache, ttl)
+        f_ens = (ex.submit(_get, OM_ENS.format(lat=OBS_LAT, lon=OBS_LON), 60, use_cache, ttl)
+                 if need_ens else None)
         f_hko = ex.submit(_get, HKO_FND, 60, use_cache, ttl)
         det = f_det.result()['daily']
-        ens = f_ens.result()['daily']
+        ens = f_ens.result()['daily'] if f_ens is not None else None
         try:
             hko = f_hko.result()['weatherForecast']
         except Exception:
@@ -319,6 +326,51 @@ def load_observed_max():
     return max(cands) if cands else None
 
 
+def watch_loop(interval_min=10, until='17:00'):
+    """常驻轮询：在一个进程里反复 watch()，复用同一条 TLS 连接。
+
+    **为什么这比"每 10 分钟起一个新进程"快 3~5 倍**：实测同一主机首次请求 1.0s、
+    连接热了之后 0.20s —— 单次运行的耗时几乎全在 TCP/TLS 握手上，跟数据量无关
+    （7 模型 10 天 1.02s vs 1 模型 2 天 0.20s，差的只是握手）。每 10 分钟一个新
+    进程就要重新握一次手；常驻进程只在第一次付这笔钱，之后每次约 0.3~0.5s。
+
+    数字完全不变：走的还是同一个 watch()，只是调用它的方式变了。
+    """
+    import time as _time
+    hh, mm = (int(x) for x in until.split(':'))
+    print(f"[loop] 每 {interval_min} 分钟采集一次，直到 {until} HKT（Ctrl-C 退出）")
+    n = 0
+    while True:
+        now = dt.datetime.now(TZ)
+        end = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if now >= end:
+            print(f"[loop] 已过 {until}，退出（共采集 {n} 次）")
+            break
+        n += 1
+        print(f"[loop] #{n}  {now:%H:%M:%S}", flush=True)
+        try:
+            watch()
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            print(f"[loop] 本次采集失败: {type(e).__name__}: {e}", flush=True)
+        # 对齐到下一个 interval 边界，避免漂移
+        nxt = (dt.datetime.now(TZ) + dt.timedelta(minutes=interval_min)).replace(
+            second=0, microsecond=0)
+        nxt -= dt.timedelta(minutes=nxt.minute % interval_min)
+        delay = (nxt - dt.datetime.now(TZ)).total_seconds()
+        if delay <= 0:
+            delay = interval_min * 60
+        remain = (end - dt.datetime.now(TZ)).total_seconds()
+        if remain <= 0:
+            continue
+        try:
+            _time.sleep(min(delay, remain))
+        except KeyboardInterrupt:
+            print(f"\n[loop] 已停止（共采集 {n} 次）")
+            break
+
+
 def bucket_probs(target, det, ens, calib, mu_override=None, floor=None, sd_override=None):
     """
     目标日每个整数档的公允概率。
@@ -339,13 +391,14 @@ def bucket_probs(target, det, ens, calib, mu_override=None, floor=None, sd_overr
         raise SystemExit("[err] 无确定性预报")
     det_mean = sum(dv) / len(dv)
 
-    members = [ens[k][i] for k in ens if k.startswith('temperature_2m_max_member')
-               and ens[k][i] is not None]
-    if not members:
-        members = [det_mean]
-    ens_mean = sum(members) / len(members)
+    # ens 为 None = 调用方跳过了集合请求（只在 --sigma 给出时允许）
+    members = ([ens[k][i] for k in ens if k.startswith('temperature_2m_max_member')
+                and ens[k][i] is not None] if ens else [])
+    ens_mean = sum(members) / len(members) if members else det_mean
+    # 没有集合成员时离散度不可得 → None，调用方显示 n/a
+    spread = (math.sqrt(sum((x - ens_mean) ** 2 for x in members) / len(members))
+              if members else None)
     mu = det_mean + calib['bias'] if mu_override is None else mu_override
-    spread = math.sqrt(sum((x - ens_mean) ** 2 for x in members) / len(members))
     # resid_sd 是「提前一天」的不确定性；接近收盘时剩余不确定性小得多，可用 --sigma 收窄
     sd = calib['resid_sd'] if sd_override is None else sd_override
     # dressed ensemble: 偏差修正后的点估计 + 集合距平 + 残差噪声
@@ -564,6 +617,11 @@ def main():
     ap.add_argument('--hold', help='已持有头寸 "档位:成本价:份数[:Y|N],..."（N=持有 NO），'
                                    '例 "34:0.065:200,33:0.56:70:N" → 输出浮盈与止盈建议')
     ap.add_argument('--watch', action='store_true', help='当日实时追踪')
+    ap.add_argument('--loop', action='store_true',
+                    help='配合 --watch：常驻进程内反复采集，复用同一条 TLS 连接'
+                         '（单次运行的耗时几乎全是握手，常驻只在第一次付这笔钱）')
+    ap.add_argument('--loop-min', type=int, default=10, help='--loop 的间隔分钟数（默认 10）')
+    ap.add_argument('--until', default='17:00', help='--loop 的停止时刻 HKT（默认 17:00）')
     ap.add_argument('--recalibrate', action='store_true')
     ap.add_argument('--ttl', type=int, default=CACHE_TTL,
                     help=f'模式/预报类接口的缓存秒数（默认 {CACHE_TTL}s=15分钟；'
@@ -574,11 +632,16 @@ def main():
     a = ap.parse_args()
 
     if a.watch:
-        watch()
+        if a.loop:
+            watch_loop(a.loop_min, a.until)
+        else:
+            watch()
         return
 
     calib = recalibrate(force=a.recalibrate, use_cache=not a.no_cache, ttl=a.ttl)
-    det, ens, hko = fetch_forecasts(use_cache=not a.no_cache, ttl=a.ttl)
+    # --sigma 给出时概率直接用 N(mu, sigma)，集合成员不进入计算 → 跳过最慢的那个请求
+    need_ens = a.sigma is None
+    det, ens, hko = fetch_forecasts(use_cache=not a.no_cache, ttl=a.ttl, need_ens=need_ens)
     _cache_save()
     hko_map = {f"{x['forecastDate'][:4]}-{x['forecastDate'][4:6]}-{x['forecastDate'][6:]}":
                x['forecastMaxtemp']['value'] for x in hko}
@@ -638,8 +701,10 @@ def main():
         lead = (dt.date.fromisoformat(t) - dt.datetime.now(TZ).date()).days
         tag = " [手动覆盖]" if r.get('manual_mu') else ""
         ftag = f"  | 下限 {r['floor']}°C [已截断]" if r.get('floor') is not None else ""
+        # 跳过集合请求时（--sigma）离散度不可得，如实标 n/a，不要假装有数
+        sp = f"±{r['spread']:.2f}°C" if r.get('spread') is not None else "n/a(--sigma)"
         print(f"\n■ {t} (提前 {lead} 天)  点估计 {r['mu']:.2f}°C{tag}  "
-              f"| 集合离散度 ±{r['spread']:.2f}°C  残差sd {r['sd']:.2f}"
+              f"| 集合离散度 {sp}  残差sd {r['sd']:.2f}"
               f"  | HKO官方预报 {hko_map.get(t, '?')}°C{ftag}")
         hdr = f"  {'档位':>6} {'公允P':>8} {'市场价':>8} {'动作':>14} {'EV':>7}"
         hdr += f" {f'{KELLY_FRAC:.0%}Kelly(金额/份数)':>22}"   # 有 edge 就必须给出仓位
