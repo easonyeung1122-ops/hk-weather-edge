@@ -26,7 +26,7 @@ Polymarket「香港最高气温」市场 Edge 计算器
 import argparse, json, math, os, sys, time, datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "0.9.0"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
+VERSION = "0.10.0"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
 
 # Kelly 缩放：满 Kelly 波动太大、且概率本身有 ±5% 量级误差，实操一律打折。
 # 这里用 35% Kelly（原来是 1/4=25%）。
@@ -58,6 +58,24 @@ def _http(u, t):
     import urllib.request
     req = urllib.request.Request(u, headers={'User-Agent': 'Mozilla/5.0'})
     return json.load(urllib.request.urlopen(req, timeout=t))
+
+
+def _http_raw(u, t=20):
+    """取原始文本（CSV 等非 JSON 接口用）。与实况相关，永不缓存。"""
+    global _SESSION
+    if _SESSION is None:
+        try:
+            import requests
+            _SESSION = requests.Session()
+        except ImportError:
+            _SESSION = False
+    if _SESSION:
+        r = _SESSION.get(u, timeout=t)
+        r.raise_for_status()
+        return r.text
+    import urllib.request
+    req = urllib.request.Request(u, headers={'User-Agent': 'Mozilla/5.0'})
+    return urllib.request.urlopen(req, timeout=t).read().decode('utf-8-sig')
 
 CACHE_TTL = 900          # 15 分钟：远小于任何模式的更新周期
 _CACHE_PATH = None       # 绑定到 DATA 后赋值
@@ -104,6 +122,11 @@ MODELS = "ecmwf_ifs025,gfs_seamless,icon_seamless,gem_seamless,metno_seamless,jm
 HKO_RHR   = "https://data.weather.gov.hk/weatherAPI/opendata/weather.php?dataType=rhrread&lang=en"
 HKO_FND   = "https://data.weather.gov.hk/weatherAPI/opendata/weather.php?dataType=fnd&lang=en"
 HKO_MAXT  = "https://data.weather.gov.hk/weatherAPI/opendata/opendata.php?dataType=CLMMAXT&station=HKO&lang=en"
+# 分区气温 CSV：0.1°C 精度、每 10 分钟更新、39 个站（含结算站）。
+# 结算站在这个 CSV 里的名字是 "HK Observatory"（不是 rhrread 里的 "Hong Kong Observatory"）。
+HKO_OBS_1MIN = ("https://data.weather.gov.hk/weatherAPI/hko_data/regional-weather/"
+                "latest_1min_temperature.csv")
+OBS_STATION_NAMES = ('HK Observatory', 'Hong Kong Observatory')
 OM_FC     = ("https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
              "&daily=temperature_2m_max&forecast_days=10&timezone=Asia%2FShanghai&models={m}")
 OM_ENS    = ("https://ensemble-api.open-meteo.com/v1/ensemble?latitude={lat}&longitude={lon}"
@@ -203,23 +226,97 @@ def fetch_forecasts(use_cache=True, ttl=CACHE_TTL):
     return det, ens, hko
 
 
+def _obs1min_path():
+    return os.path.join(DATA, 'obs_1min_log.json')
+
+
+def _load_1min_log():
+    """今日的 0.1°C 观测序列（跨天自动作废）。"""
+    p = _obs1min_path()
+    if not os.path.exists(p):
+        return {}
+    try:
+        d = json.load(open(p))
+        today = dt.datetime.now(TZ).date().isoformat()
+        return d if d.get('date') == today else {}
+    except Exception:
+        return {}
+
+
+def fetch_hko_1min(record=True):
+    """读分区气温 CSV（0.1°C / 10 分钟），并把结算站读数追加进 running-max 日志。
+
+    为什么必须有它：`rhrread` 的 temperature **只有整数位且每小时更新**，在结算值
+    刚跨过整数边界时会双重失真——① 漏掉整点之间的升温（2026-09-09 13:00 报 31，
+    实际 13:40 已 32.2，差 1.2°C）；② 整数舍入撑开 ±0.5°C 未知，足以改变档位归属。
+    这是唯一能免费拿到 0.1°C 结算站实况的源。
+
+    注意它只给「最新一笔」，不自带当日最高 —— running max 靠每 10 分钟轮询累积，
+    轮询越密，漏掉的峰值越小（10 分钟级 ≈ 0.2~0.3°C，rhrread 级实测可达 1.2°C）。
+
+    返回 {'ts': ISO时刻, 'hko': 温度, 'all': {站名: 温度}}；失败返回 None。
+    """
+    try:
+        txt = _http_raw(HKO_OBS_1MIN, 20)
+    except Exception:
+        return None
+    rows, stamp = {}, None
+    for ln in txt.strip().splitlines()[1:]:
+        p = [c.strip() for c in ln.split(',')]
+        if len(p) < 3:
+            continue
+        stamp = stamp or p[0]
+        try:
+            rows[p[1]] = float(p[2])
+        except ValueError:
+            continue
+    if not rows or not stamp or len(stamp) < 12:
+        return None
+    hko = next((rows[n] for n in OBS_STATION_NAMES if n in rows), None)
+    if hko is None:
+        return None
+    iso = f"{stamp[0:4]}-{stamp[4:6]}-{stamp[6:8]}T{stamp[8:10]}:{stamp[10:12]}:00+08:00"
+    if record:
+        try:
+            log = _load_1min_log() or {'date': iso[:10], 'points': []}
+            if all(pt.get('t') != iso for pt in log['points']):
+                log['points'].append({'t': iso, 'hko': hko})
+                json.dump(log, open(_obs1min_path(), 'w'))
+        except Exception:
+            pass
+    return {'ts': iso, 'hko': hko, 'all': rows}
+
+
+def load_1min_max():
+    """今日 0.1°C 源已观测到的最高温（running max）。无数据返回 None。"""
+    vals = [pt.get('hko') for pt in _load_1min_log().get('points', [])
+            if pt.get('hko') is not None]
+    return max(vals) if vals else None
+
+
 def load_observed_max():
-    """从 --watch 的日内日志里读「今日已实测到的最高温度」。
+    """从日内日志里读「今日已实测到的最高温度」。
 
     日最高温具有单调性：已经观测到的值就是当日峰值的下限。
     日内复盘时必须以此为条件截断分布，否则会给出物理上不可能的低档概率。
+
+    优先取 0.1°C 分区气温源的 running max，再与 `--watch` 的整点日志取大者——
+    后者是整数位、每小时一次，只作为前者缺失时的兜底。
     """
     p = os.path.join(DATA, 'intraday_log.json')
-    if not os.path.exists(p):
-        return None
-    try:
-        log = json.load(open(p))
-        if log.get('date') != dt.datetime.now(TZ).date().isoformat():
-            return None
-        vals = [pt.get('hko') for pt in log.get('points', []) if pt.get('hko') is not None]
-        return max(vals) if vals else None
-    except Exception:
-        return None
+    mx = None
+    if os.path.exists(p):
+        try:
+            log = json.load(open(p))
+            if log.get('date') == dt.datetime.now(TZ).date().isoformat():
+                vals = [pt.get('hko') for pt in log.get('points', [])
+                        if pt.get('hko') is not None]
+                mx = max(vals) if vals else None
+        except Exception:
+            pass
+    m1 = load_1min_max()
+    cands = [v for v in (mx, m1) if v is not None]
+    return max(cands) if cands else None
 
 
 def bucket_probs(target, det, ens, calib, mu_override=None, floor=None, sd_override=None):
@@ -280,19 +377,27 @@ def watch():
     now = dt.datetime.now(TZ)
     # 观测与网格实况互不依赖 → 并行拉取（两者都属实况，永不缓存）
     # past_hours 拉到今天 0 时：没采样到的小时要靠网格回填（见下方"回填未采样"）
-    ex = ThreadPoolExecutor(max_workers=2)
+    ex = ThreadPoolExecutor(max_workers=3)
+    # 0.1°C / 10 分钟的分区气温是首选实况源；rhrread（整点整数）只作兜底
+    f_1min = ex.submit(fetch_hko_1min)
     f_rhr = ex.submit(_get, HKO_RHR, 30)
     f_grid = ex.submit(_get, OM_HR.format(lat=OBS_LAT, lon=OBS_LON,
                                          ph=max(3, now.hour + 1)), 30)
-    try:
-        r = f_rhr.result()
-    except Exception as e:
-        print(f"[err] 无法读取天文台实时数据: {e}")
-        ex.shutdown(wait=False)
-        return
-    temp = {t['place']: t['value'] for t in r['temperature']['data']}
-    rt = r['temperature']['recordTime']
-    hko_t = temp.get('Hong Kong Observatory')
+    m1 = f_1min.result()
+    if m1 and m1.get('hko') is not None:
+        rt, hko_t, temp = m1['ts'], m1['hko'], m1['all']
+        src_note = "分区气温CSV 0.1°C/10分钟"
+    else:
+        try:
+            r = f_rhr.result()
+        except Exception as e:
+            print(f"[err] 无法读取天文台实时数据: {e}")
+            ex.shutdown(wait=False)
+            return
+        temp = {t['place']: t['value'] for t in r['temperature']['data']}
+        rt = r['temperature']['recordTime']
+        hko_t = temp.get('Hong Kong Observatory')
+        src_note = "rhrread 整点整数（0.1°C 源不可用，已回落——整数位会漏掉整点间升温）"
     today = dt.datetime.now(TZ).date().isoformat()
     log_p = os.path.join(DATA, 'intraday_log.json')
     log = json.load(open(log_p)) if os.path.exists(log_p) else {}
@@ -302,15 +407,24 @@ def watch():
     json.dump(log, open(log_p, 'w'))
 
     pts = [p for p in log['points'] if p['hko'] is not None]
-    mx = max(p['hko'] for p in pts) if pts else None
+    # running max：0.1°C 源与整点日志取大者（前者精度高、采样密）
+    _mx_cands = [v for v in (
+        max((p['hko'] for p in pts), default=None), load_1min_max()) if v is not None]
+    mx = max(_mx_cands) if _mx_cands else None
     sampled_h = {int(p['t'][11:13]) for p in pts}
-    others = {k: v for k, v in temp.items() if k != 'Hong Kong Observatory'}
+    for pt in _load_1min_log().get('points', []):
+        try:
+            sampled_h.add(int(pt['t'][11:13]))
+        except (TypeError, ValueError):
+            pass
+    others = {k: v for k, v in temp.items() if k not in OBS_STATION_NAMES}
     hot = sorted(others.items(), key=lambda x: -x[1])[:5]
     try:
         obs_h = int(rt[11:13])          # 观测时刻——所有小时内推算都以它为基准
     except (TypeError, ValueError):
         obs_h = now.hour
     print(f"\n香港时间 {rt[11:16]}  天文台站 {hko_t}°C   今日已观测最高 {mx}°C  (样本 {len(pts)})")
+    print(f"  实况源: {src_note}")
     if hko_t is not None and now.hour > obs_h:
         print(f"  ⚠ 天文台观测滞后 {now.hour - obs_h} 小时（最新记录 {rt[11:16]}），"
               f"以下推算全部以观测时刻为基准")
@@ -491,9 +605,14 @@ def main():
         floor_max = load_observed_max()
         if floor_max is not None:
             floor_src = 'intraday_log.json（--watch 记录）'
-    if floor_max is not None:
+    # 只有当日（--date 未给或 == today）才用已观测最高温截断；查未来日期时截断不适用，
+    # 此时若照常打印会让读者误以为分布已被截断（实际 bucket_probs 里 floor=None）
+    _floor_applies = floor_max is not None and (a.date is None or a.date == today)
+    if _floor_applies:
         print(f"已观测下限: {today} 实测最高 {floor_max}°C（来源 {floor_src}）"
               f" → 当日分布截断重命名")
+    elif floor_max is not None:
+        print(f"注: {today} 已实测最高 {floor_max}°C 已知，但目标日不是当日 → 不做截断")
     print("=" * 78)
 
     targets = [a.date] if a.date else [d for d in det['time'] if d >= today][:7]
