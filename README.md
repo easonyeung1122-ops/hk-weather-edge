@@ -1,6 +1,6 @@
 # hk-weather-edge
 
-> 当前版本 **v0.13.3** —— 每次更新的改动见 [CHANGELOG.md](CHANGELOG.md)。
+> 当前版本 **v0.13.4** —— 每次更新的改动见 [CHANGELOG.md](CHANGELOG.md)。
 
 CodeBuddy / Claude 技能包：Polymarket「香港最高气温」日度市场的 **edge 计算与实况外推**。
 

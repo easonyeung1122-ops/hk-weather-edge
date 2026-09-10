@@ -10,9 +10,65 @@
 递增版本号 → 在下面加一条 → 同步三处：`README.md` 顶部版本行、
 `SKILL.md` frontmatter 的 `version:`、`scripts/hk_edge.py` 的 `VERSION` 常量。
 
-当前版本：**v0.13.3**（`py -3 scripts/hk_edge.py --version` 可查）
+当前版本：**v0.13.4**（`py -3 scripts/hk_edge.py --version` 可查）
 
 ---
+
+## v0.13.4 — 2026-09-10 · 彻底消除计划任务每次触发弹出的命令框（PATCH）
+
+**`hk_edge.py` 除版本号外一行未动，任何输出数字不变。**
+
+### 现象
+
+用户报告：计划任务每次触发，屏幕弹出一个 `cmd.exe` 黑框，框里是乱码，
+如 `'鍛戒护妗嗐€?rem' 不是内部或外部命令`。
+
+### 根因（两个独立缺陷叠加）
+
+1. **每次触发必弹窗。** 任务动作是 `watch.bat`。`.bat` 只能由 cmd.exe 解析，而 cmd.exe 是控制台
+   子系统程序，Windows 必须给它一个控制台；任务以「交互」身份运行，这个控制台就是屏幕上那个框。
+   触发频率实测 `PT30M` / `PT6H` / 起始 11:00 —— 每天 11:00–17:00 每 30 分钟一次，与用户看到的
+   14:00 / 14:30 / 15:00 / 16:00 / 16:30 完全吻合。
+
+2. **框里的乱码。** `watch.bat` 被写成了 UTF-8 编码 + LF 换行，而 cmd.exe 按系统 ANSI 代码页
+   （中文 Windows = GBK）解析 .bat。UTF-8 中文注释解成乱码，同时 LF 换行让 `rem` 词元被粘到
+   上一行行尾，于是 cmd 把注释当命令执行，刷出满屏「不是内部或外部命令」。
+
+两项都用对照实验复现过：同一段注释，**UTF-8+LF 版**输出 4 行乱码报错（与用户截图逐字相同），
+**ASCII+CRLF 版**输出 `PARSE_OK` 且零报错。
+
+### 修法
+
+1. **`watch.bat` 重写为纯 ASCII + CRLF**（实测 1263 字节 / 20 CRLF / 0 裸 LF）。
+   仍会弹窗 —— 这是 `.bat` 的固有属性，无法规避 —— 但不再产生任何报错。
+
+2. **新增 `scripts/watch_silent.py`，计划任务改为直接由 `pythonw.exe` 启动它。**
+   `pythonw.exe` 是 GUI 子系统程序，Windows 根本不为其创建控制台，**零窗口**。
+   实测：手动 `Start-ScheduledTask` 后前后两次枚举窗口均为 0 个可见控制台。
+
+   **为什么不直接指向已有的 `watch_silent.vbs`**：`WScript.Shell.Run(..., 0, False)` **立刻返回**，
+   计划任务会在 1 秒内判定「已完成」，`MultipleInstances=IgnoreNew` 随之失效 —— 每 30 分钟再叠一个
+   新循环，最多 12 个并发打 API。直接启动 `pythonw.exe` 时，任务全程保持 `Running`
+   （实测 `LastTaskResult = 0x41301`），`IgnoreNew` 才真正成为看门狗：只在上一轮已死时才重启。
+
+3. **`watch_silent.py` 自带 PID 锁**（`.watch_loop.pid` + 存活性检查），防手工双击与计划任务撞车。
+   硬杀后残留的锁无害：启动时检查 pid 是否仍存活，已死则接管。
+
+4. **日志改由 Python 自己打开，放弃 shell 重定向。** 这条是被实测逼出来的：cmd.exe 的 `>>`
+   重定向句柄**拒绝写共享**，所以只要旧式循环还活着，其它进程 append `watch.log` 一律
+   `PermissionError [Errno 13]`（2026-09-10 16:35 实测）。Python 的 `open()` 允许共享，
+   全部走 `watch_silent.py` 后这类争用消失。同时把失败兜底从 `os.devnull` 换成 `watch_err.log`
+   —— 一个跑完却什么都没记的启动器，比一个会报错的更糟。
+
+5. **修 `stop_watch.vbs`。** 原匹配条件是「命令行含 `hk_edge.py` **且**含 `--loop`」，而
+   `watch_silent.py` 是导入 `hk_edge` 自行调用 `main()`，命令行里两者都没有 —— 老条件会对正在
+   运行的循环报「没有找到」。现额外匹配 `watch_silent.py`（已实测命中），硬杀后顺带清理锁文件。
+
+### 顺带发现（写进 SKILL.md 排障节）
+
+**不要在一个 cmd.exe 正在执行的 .bat 上做就地改写。** 排查过程中我重写了 `watch.bat`，正在执行的
+cmd 重新读取了文件内容，同一个 cmd 又起了一个 `python.exe --loop`（16:35:07，父子关系已核实）。
+计划任务的动作条目不存在这个问题 —— 它在启动时被计划任务服务快照。
 
 ## v0.13.3 — 2026-09-10 · 推翻「向市场收敛」纪律，补模式偏冷量化（PATCH）
 
