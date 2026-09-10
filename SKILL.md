@@ -1,6 +1,6 @@
 ---
 name: hk-weather-edge
-version: 0.13.1
+version: 0.13.2
 description: Polymarket「香港最高气温」日度市场的 edge 计算与实况外推工具。把香港天文台(HKO)开放数据 + Open-Meteo 多模式 NWP 集合转为校准后的摄氏整数档(bucket)公允概率，并与市场价对比输出 EV 与 35% Kelly 仓位建议；`--watch` 模式基于结算站实测 + 日内气候曲线做当日峰值 nowcast。当用户提到「香港气温市场」「最高气温预测」「HKO / 天文台结算」「bucket 概率」「temperature bucket edge」「今天香港会到几度」「 polymarket weather Hong Kong」，或需要判断某个整数档是否值得买 YES / NO 时使用。
 ---
 
@@ -47,6 +47,27 @@ py -3 scripts/hk_edge.py            # 首次运行会下载 HKO 历史数据(约
 ```
 
 首次运行后 `scripts/data/` 会生成 `maxt_HKO.csv`（结算源历史）与 `model_calib.json`（模型偏差/残差 sd）。
+
+### Windows：为什么会弹出一个命令框，怎么关掉（v0.13.2）
+
+**现象**：每跑一次脚本，屏幕上冒出一个黑色命令框。
+
+**原因**（是 Windows 的机制，不是脚本 bug）：`python.exe`、`cmd.exe` 都是**控制台子系统**程序，Windows 规定它们必须挂在某个控制台上。当启动它的宿主自己没有控制台时（桌面版应用、资源管理器双击、计划任务、部分 GUI 启动器），系统会**新建一个控制台窗口**给它——那个黑框就是它。
+
+两条触发路径，分开处理：
+
+| 场景 | 表现 | 处理 |
+|---|---|---|
+| **双击 `watch.bat`** | `.bat` 必须由 cmd.exe 解析 → 必开窗口；又因为带 `--loop`，框一直挂到 17:00 不关 | **改双击 `watch_silent.vbs`**（窗口样式 0，完全隐藏），停止用 `stop_watch.vbs` |
+| 由宿主/GUI 启动 `python.exe` | 宿主无控制台 → 系统为子进程新建一个 | `hk_edge.py` 启动时会自查：若该控制台**只挂着自己一个进程**且 stdout 不在终端上，就 `ShowWindow(hwnd, 0)` 自我隐藏；用户自己的终端不受影响（列表长度 > 1，不动） |
+
+自查可以用这条命令确认当前环境属于哪种（0 = 无控制台，不会弹）：
+
+```bash
+py -3 -c "import ctypes;print(ctypes.windll.kernel32.GetConsoleWindow())"
+```
+
+**注意**：自我隐藏只发生在本进程独占新建控制台时。如果确实需要在终端里看到实时输出，直接在 cmd / Windows Terminal 里跑即可——那种情况下脚本不会隐藏你的窗口。
 
 ## 工作流
 
@@ -302,6 +323,8 @@ py -3 scripts/analyze.py                 # 站点偏差、月度气候、日际�
 | `scripts/data/obs_1min_archive.json` | 0.1°C 结算站序列**按日归档**，攒够后可重建站点口径分位表 |
 | `scripts/data/diurnal_climatology.json` | 日内气候缓存，已随包提供（v0.13.0 起 watch 只用它兜底） |
 | `scripts/data/http_cache.json` | 模式/预报类接口的短 TTL 缓存（实况与价格不进这里） |
+| `watch_silent.vbs` | **零窗口**跑当日轮询（替代 `watch.bat`，后者必然弹黑框），输出照旧写 `watch.log` |
+| `stop_watch.vbs` | 停掉静默轮询（窗口隐藏后没有 Ctrl-C 可按，按命令行精确匹配 `hk_edge.py --loop`） |
 | `assets/docs_edge_map.html` | 完整方法论报告（含实证图表），需要时可直接在浏览器打开给用户看 |
 
 ### `analyze.py` 的额外依赖（务必先看）

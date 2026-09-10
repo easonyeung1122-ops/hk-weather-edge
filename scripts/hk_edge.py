@@ -26,7 +26,7 @@ Polymarket「香港最高气温」市场 Edge 计算器
 import argparse, json, math, os, sys, time, datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "0.13.1"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
+VERSION = "0.13.2"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
 
 # Kelly 缩放：满 Kelly 波动太大、且概率本身有 ±5% 量级误差，实操一律打折。
 # 这里用 35% Kelly（原来是 1/4=25%）。
@@ -820,7 +820,49 @@ def score():
               % (k * 20, k * 20 + 20, c, 100 * s / c))
 
 
+def _silence_own_console():
+    """Windows：若本进程拿到的是一个**只为它新建**的控制台窗口，就地隐藏。
+
+    为什么会有黑框弹出来：`python.exe` / `cmd.exe` 都是「控制台子系统」程序，
+    Windows 规定它们必须挂在某个控制台上。当启动它的宿主自己没有控制台时
+    （WorkBuddy 桌面版、资源管理器双击、计划任务、某些 GUI 启动器），
+    系统会**新建一个控制台窗口**给子进程——那个一闪而过的黑框就是它。
+    `--watch --loop` 会一直挂到 17:00，于是框也一直不关。
+
+    安全条件：只有当这个控制台**只挂着自己一个进程**、且 stdout 不在终端上
+    （输出已经有别的去处，比如管道或 `> watch.log`）时才隐藏。
+    用户在自己的 cmd / Windows Terminal 里手动跑时，控制台上还挂着 cmd.exe，
+    列表长度 > 1，这里什么都不做——绝不会把用户自己的窗口弄没。
+    """
+    if os.name != 'nt':
+        return
+    try:
+        import ctypes
+        k = ctypes.windll.kernel32
+        u = ctypes.windll.user32
+        # 必须显式声明签名：HWND 是 64 位指针，按默认 int 传会被截断；
+        # 且 ShowWindow 住在 user32，不在 kernel32（写成 kernel32.ShowWindow 会
+        # AttributeError，被下面的 except 吞掉 —— 表面无事，实际没隐藏）。
+        k.GetConsoleWindow.restype = ctypes.c_void_p
+        u.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        hwnd = k.GetConsoleWindow()
+        if not hwnd:
+            return                       # 压根没控制台，无所谓
+        try:
+            if sys.stdout.isatty():      # 用户在交互终端里看着，别动
+                return
+        except Exception:
+            pass
+        buf = (ctypes.c_uint * 32)()
+        n = k.GetConsoleProcessList(buf, 32)
+        if n <= 1:                       # 只挂着自己 → 是专为本进程新建的
+            u.ShowWindow(hwnd, 0)        # SW_HIDE
+    except Exception:
+        pass
+
+
 def main():
+    _silence_own_console()
     # Windows 下 stdout 一旦被重定向（`> watch.log`）就用 GBK，输出里的 ⚠ / 📈
     # 会直接抛 UnicodeEncodeError，把整个 --watch --loop 的采集打掉
     # （2026-09-10 13:50 实测：loop 报 "本次采集失败: UnicodeEncodeError"，当次全废）。

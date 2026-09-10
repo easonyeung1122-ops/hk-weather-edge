@@ -10,7 +10,43 @@
 递增版本号 → 在下面加一条 → 同步三处：`README.md` 顶部版本行、
 `SKILL.md` frontmatter 的 `version:`、`scripts/hk_edge.py` 的 `VERSION` 常量。
 
-当前版本：**v0.13.1**（`py -3 scripts/hk_edge.py --version` 可查）
+当前版本：**v0.13.2**（`py -3 scripts/hk_edge.py --version` 可查）
+
+---
+
+## v0.13.2 — 2026-09-10 · 干掉那个黑框（PATCH）
+
+**现象**：每跑一次脚本，屏幕上冒出一个命令窗口。
+
+**这不是脚本 bug，是 Windows 的进程模型**：`python.exe` / `cmd.exe` 都是**控制台子系统**程序，
+Windows 规定它们必须挂在控制台上。当启动它的宿主自己没有控制台时（桌面版应用、资源管理器
+双击、计划任务、部分 GUI 启动器），系统会**新建一个控制台窗口**给子进程——那就是黑框。
+`--watch --loop` 跑到 17:00 才退出，所以框也一直不关。
+
+两条触发路径，分别处理：
+
+1. **`watch.bat` 必然开窗**：`.bat` 只能由 cmd.exe 解析，而 cmd.exe 是控制台程序，
+   双击它一定出框。新增 `watch_silent.vbs`——用 `WScript.Shell.Run(..., 0, False)`
+   把窗口样式设成隐藏，输出照旧写 `watch.log`，屏幕上什么都不出现。
+   配套 `stop_watch.vbs`（窗口藏了就没有 Ctrl-C 可按，按命令行精确匹配
+   `hk_edge.py --loop` 结束进程）。`watch.bat` 保留但加了醒目注释指向 vbs。
+
+2. **宿主新建控制台**：`hk_edge.py` 启动时自查——若该控制台**只挂着自己一个进程**
+   （`GetConsoleProcessList` 返回 1）且 stdout 不在终端上，就 `ShowWindow(hwnd, SW_HIDE)`
+   自我隐藏。用户在 cmd / Windows Terminal 里手动跑时，控制台上还挂着 cmd.exe，
+   列表长度 > 1，**不动**——不会把用户自己的窗口弄没。
+
+实测对拍（`CREATE_NO_WINDOW` vs `CREATE_NEW_CONSOLE` 启动同一个探针）：
+
+| 启动方式 | 控制台 | 窗口可见 | 结果 |
+|---|---|---|---|
+| `CREATE_NO_WINDOW`（当前宿主） | 无 | — | 不需要处理 |
+| `CREATE_NEW_CONSOLE`（GUI 启动器） | 有，仅 1 个进程 | 可见 → **隐藏** | 自我隐藏生效 |
+
+**中途踩的坑**：第一版写成了 `kernel32.ShowWindow`——`ShowWindow` 住在 **user32**，
+`kernel32.ShowWindow` 直接 `AttributeError`；而它被 `try/except` 吞掉，表面无事、
+实际根本没隐藏。同时 HWND 是 64 位指针，必须 `restype = c_void_p` +
+`argtypes = [c_void_p, c_int]`，否则按默认 int 传会被截断。两者都已在代码里注明。
 
 ---
 
