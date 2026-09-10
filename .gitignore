@@ -21,3 +21,4 @@ venv/
 watch.log
 watch.bat
 *.log
+scripts/data/_era5_hourly_cache.json

@@ -26,7 +26,7 @@ Polymarket「香港最高气温」市场 Edge 计算器
 import argparse, json, math, os, sys, time, datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "0.11.0"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
+VERSION = "0.13.0"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
 
 # Kelly 缩放：满 Kelly 波动太大、且概率本身有 ±5% 量级误差，实操一律打折。
 # 这里用 35% Kelly（原来是 1/4=25%）。
@@ -136,6 +136,59 @@ OM_PREV   = ("https://previous-runs-api.open-meteo.com/v1/forecast?latitude={lat
 OM_HR     = ("https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
              "&hourly=temperature_2m&forecast_days=1&past_hours={ph}"
              "&timezone=Asia%2FShanghai&models=best_match")
+
+
+# ---------------------------------------------------------------- 下次刷新时刻
+# 「算完就忘」是本工具最大的实操漏洞：概率的输入源各自有更新节奏，结论只在下一批
+# 新数据落地前有效。所有刷新锚点均来自实测（见 SKILL.md「各数据源更新频率」表）。
+MARKET_CLOSE_HKT = 20      # Polymarket 收盘 = 目标日 12:00 UTC = 20:00 HKT
+NWP_LAND_HKT     = (2, 8, 14, 20)          # NWP 新一轮落地（00/06/12/18 UTC + ~2h）
+FND_UPDATE_HKT   = tuple(range(7, 23, 2))  # HKO 九天预报约每 2 小时更新（:30 前后）
+PEAK_WINDOW      = (12, 17)                # 日最高温峰值窗口，此间必须 10 分钟级盯
+
+def next_refresh(now, target, is_today):
+    """下一个值得重跑的时刻。now 为 HKT aware datetime，target 为目标日 date。
+    返回 (datetime, 理由)；已过收盘返回 (None, None)。"""
+    close = dt.datetime.combine(target, dt.time(MARKET_CLOSE_HKT, 0), tzinfo=TZ)
+    if now >= close:
+        return None, None
+    cands = []
+    for d in (0, 1):
+        day = now.date() + dt.timedelta(days=d)
+        for h in NWP_LAND_HKT:
+            t = dt.datetime.combine(day, dt.time(h, 0), tzinfo=TZ)
+            if now < t <= close:
+                cands.append((t, 'NWP 多模式新一轮落地（决定点估计，最重要）'))
+        for h in FND_UPDATE_HKT:
+            t = dt.datetime.combine(day, dt.time(h, 30), tzinfo=TZ)
+            if now < t <= close:
+                cands.append((t, 'HKO 九天预报 fnd 更新（官方口径，措辞变化优先于数字）'))
+    if is_today:
+        if PEAK_WINDOW[0] <= now.hour <= PEAK_WINDOW[1]:
+            t = (now.replace(minute=0, second=0, microsecond=0)
+                 + dt.timedelta(minutes=(now.minute // 10 + 1) * 10))
+            if t <= close:
+                cands.append((t, '峰值窗口：0.1°C 实况每 10 分钟（--watch 必须跟上，漏峰会低估已观测下限）'))
+        t = now.replace(minute=5, second=0, microsecond=0)
+        if t <= now:
+            t += dt.timedelta(hours=1)
+        if t <= close:
+            cands.append((t, 'HKO 整点实况 rhrread（整点后约 5 分）'))
+    return min(cands, key=lambda x: x[0]) if cands else (None, None)
+
+
+def print_next_refresh(now, target, is_today):
+    t, why = next_refresh(now, target, is_today)
+    print()
+    if t is None:
+        print(f"■ 下次刷新：—— 目标日 {target} 已于 {MARKET_CLOSE_HKT}:00 HKT 收盘，"
+              f"不再有重跑价值（结算后回填 decision_log.csv）")
+        return
+    mins = int((t - now).total_seconds() // 60)
+    hh = f"{mins // 60}h{mins % 60:02d}m" if mins >= 60 else f"{mins}m"
+    print(f"■ 下次刷新：{t.strftime('%m-%d %H:%M')} HKT（{hh} 后） —— {why}")
+    print(f"  盘口价实时变动，想盯盘随时跑 market_prices.py；"
+          f"本结论在下一批新数据落地前有效。")
 
 
 # ---------------------------------------------------------------- 工具
@@ -286,12 +339,57 @@ def fetch_hko_1min(record=True):
     if record:
         try:
             log = _load_1min_log() or {'date': iso[:10], 'points': []}
+            if log.get('date') != iso[:10]:
+                _archive_1min(log)          # 跨天：先把昨天归档，再开新一天
+                log = {'date': iso[:10], 'points': []}
             if all(pt.get('t') != iso for pt in log['points']):
                 log['points'].append({'t': iso, 'hko': hko})
                 json.dump(log, open(_obs1min_path(), 'w'))
         except Exception:
             pass
     return {'ts': iso, 'hko': hko, 'all': rows}
+
+
+def _archive_1min(log):
+    """把一整天的 0.1°C 结算站序列归档到 data/obs_1min_archive.json。
+
+    这是 skill 长期变好的**唯一途径**：ERA5 网格的剩余升温尾部比真实站点薄约 4.7 倍
+    （9月 h=13 的 P(剩余升温≥0.5)：网格 7.0% vs 机场站 32.8%），只有攒够结算站自己的
+    10 分钟级序列，才能把分位表换成站点口径。攒够后跑
+    `python scripts/build_remaining_rise.py --from-station` 重建。
+    """
+    if not log or not log.get('points'):
+        return
+    p = os.path.join(DATA, 'obs_1min_archive.json')
+    arc = {}
+    if os.path.exists(p):
+        try:
+            arc = json.load(open(p))
+        except Exception:
+            arc = {}
+    d = log['date']
+    if d in arc and len(arc[d]) >= len(log['points']):
+        return
+    arc[d] = [{'t': pt.get('t'), 'hko': pt.get('hko')} for pt in log['points']]
+    json.dump(arc, open(p, 'w'))
+
+
+def _log_forecast(day, ts, hour, rm, pred, probs):
+    """把每次 watch 的概率向量记进 data/forecast_log.jsonl，供 `--score` 打回。
+
+    没有落地记录就只能靠人工事后复盘，而人工复盘恰恰是这套东西反复出错的原因
+    （2026-09-08 到 09-10 连续三轮偏差都是事后才发现的）。
+    """
+    if not probs:
+        return
+    try:
+        with open(os.path.join(DATA, 'forecast_log.jsonl'), 'a', encoding='utf-8') as f:
+            f.write(json.dumps({'date': day, 't': ts, 'hour': hour, 'rm': rm,
+                                'pred': pred,
+                                'probs': {str(k): round(v, 4) for k, v in probs.items()}},
+                               ensure_ascii=False) + "\n")
+    except Exception:
+        pass
 
 
 def load_1min_max():
@@ -425,6 +523,28 @@ def bucket_probs(target, det, ens, calib, mu_override=None, floor=None, sd_overr
 
 
 # ---------------------------------------------------------------- 当日实时追踪
+def cdf_upper(tbl, x):
+    """经验分布的上尾概率 P(R ≥ x)。
+
+    tbl = {"n": int, "q": [[p, value], ...]}，q 按下侧分位概率升序。
+    用于「剩余升温」的历史经验分布——它不是正态，右偏且 0 处有原子
+    （13 时后大多数日子当天最高已经出现过了），正态假设会把两端都算错：
+    近端高估 41%、远端低估 3.4 倍（ERA5 9月实测）。
+    """
+    q = tbl.get('q') or []
+    if not q:
+        return None
+    if x <= q[0][1]:
+        return 1.0 - q[0][0]
+    for i in range(1, len(q)):
+        if x <= q[i][1]:
+            p0, v0 = q[i - 1]
+            p1, v1 = q[i]
+            f = 0.0 if v1 == v0 else (x - v0) / (v1 - v0)
+            return max(0.0, min(1.0, 1.0 - (p0 + f * (p1 - p0))))
+    return 0.0
+
+
 def watch():
     """实时追踪：记录当日天文台站已观测到的最高温度（供 cron 每 10 分钟调用）"""
     now = dt.datetime.now(TZ)
@@ -491,6 +611,12 @@ def watch():
     try:
         calib = json.load(open(os.path.join(DATA, 'model_calib.json')))
         diur = json.load(open(os.path.join(DATA, 'diurnal_climatology.json')))
+        # 剩余升温的历史经验分位表（scripts/build_remaining_rise.py 生成）
+        _rr = os.path.join(DATA, 'remaining_rise_cdf.json')
+        rcdf = json.load(open(_rr)) if os.path.exists(_rr) else None
+        if rcdf is None:
+            print("  ⓘ 缺少 remaining_rise_cdf.json，回退到气候表+正态"
+                  "（python scripts/build_remaining_rise.py 可重建）")
         hh = obs_h       # 以"观测时刻"为基准，不是"现在"——两者不一致时若用现在，
                          # 会拿上一小时的实测去比对下一小时的网格，凭空造出偏差
         if str(now.month) in diur and str(hh) in diur[str(now.month)]:
@@ -519,7 +645,22 @@ def watch():
                 # 回填偏差**封顶在气候值**：单点偏差今天能在 1 小时内摆 ±1.3°C
                 # （09-08：15时 +0.3 → 16时 +1.7），直接拿它去外推没采样的小时，
                 # 会凭空宣称"中午已经到过 33.1°C"。宁可低估（有实测兜底），不可高估。
-                fill_bias = min(cur_bias, calib['bias'])
+                # 偏差**不再封顶在气候值**。旧版 min(cur_bias, 气候偏差) 在干燥晴热天
+                # 制造系统性偏冷：当天实测偏差长期维持在 +2.4 而不回归到 +1.01，
+                # 封顶等于硬砍掉 1.4°C（2026-09-10 上午 P32 被市场一路打脸就是这么来的）。
+                # 改用「今日已采样时段的中位偏差」抗单点噪声，只留一个宽 sane 带。
+                devs = []
+                for p in pts:
+                    try:
+                        ph = int(p['t'][11:13])
+                    except (TypeError, ValueError):
+                        continue
+                    if ph in grid_by_h:
+                        devs.append(p['hko'] - grid_by_h[ph])
+                devs.sort()
+                robust_bias = devs[len(devs) // 2] if len(devs) >= 3 else cur_bias
+                fill_bias = min(max(robust_bias, calib['bias'] - 1.0),
+                                calib['bias'] + 2.5)
                 mx_rec = mx
                 if mx is not None:
                     for h in sorted(grid_by_h):
@@ -532,62 +673,73 @@ def watch():
                     intraday_mx = mx_rec
                     print(f"     ⓘ 观测有漏点，已按偏差{fill_bias:+.2f}回填未采样时段："
                           f"已观测最高 {mx}°C → {mx_rec:.1f}°C（测站在其间可能已达此值）")
-                k = calib['bias'] - cur_bias                # 站点升温加成
-                # —— 已过峰值守卫 ——
-                # 气候表 d['mean'] = 平均而言"还能升多少"，它是无条件统计：既包含
-                # 仍在升温的日子，也包含"已冲到峰值又回落"的日子。一旦实测已经比
-                # 今日已观测最高低了一截(回落 g)，且处于典型峰值时段(14 时)之后，
-                # 当日峰值大概率已定格——无条件期望必须大幅收窄，只留少量
-                # "晚些反弹创出新高"的可能。这正是"外推低于已实测最高"这族问题
-                # 的另一面：前者发生在早上(网格还没到过那么高)，后者在下午(已经到过)。
-                g = float(intraday_mx - hko_t) if intraday_mx is not None else 0.0
-                post = g >= 0.3 and hh >= 14
-                if post:
-                    s_hour = min(1.0, max(0.0, (hh - 14) / 2.0))   # 14时→0, 16时→1
-                    s_gap = min(1.0, max(0.0, (g - 0.3) / 1.2))    # 回落0.3→0, 1.5→1
-                    s = min(s_hour, s_gap)                         # 两者都到位才算过峰
-                    gross = d['mean'] + k
-                    net = max(0.0, gross - g)          # 已回落的幅度不再支撑新高
-                    rise_m = net * (1 - 0.75 * s)      # 过峰越强，剩余升温期望越收窄
-                    rise_sd = max(0.1, d['sd'] * (1 - 0.4 * s))
-                else:
-                    rise_m = d['mean'] + k
-                    rise_sd = d['sd']
-                peak_raw = hko_t + rise_m
-                if intraday_mx is not None and peak_raw < intraday_mx:
-                    if not post:
-                        print(f"\n  ⚠ 外推 {peak_raw:.2f}°C 低于今日已观测最高 {intraday_mx}°C，"
-                              f"已按已观测值取下限（日内最高具有单调性）")
-                    peak = float(intraday_mx)
-                else:
-                    peak = peak_raw
-                print(f"\n  📈 日内外推（气候基准 n={d['n']}）")
-                print(f"     此刻 实测{hko_t}°C / 网格{grid_now}°C → 站点偏差{cur_bias:+.2f}")
-                print(f"     {hh}时后气候平均还能升 {d['mean']:.2f}°C(±{d['sd']:.2f})，"
-                      f"站点加成 {k:+.2f}")
-                if post:
-                    print(f"     ⚠ 已过峰值信号：实测已从今日最高回落 {g:.1f}°C"
-                          f"（{hh} 时 ≥ 14 时典型峰值窗口）"
-                          f" → 剩余升温期望 {d['mean'] + k:.2f} → {rise_m:.2f}°C，"
-                          f"离散 {rise_sd:.2f}°C")
-                print(f"     ⇒ 今日峰值估计 {peak:.2f}°C  "
-                      f"区间[{peak - rise_sd:.1f}, {peak + rise_sd:.1f}]  "
-                      f"→ 众数档 {int(math.floor(peak))}°C")
-                for b in range(int(math.floor(peak)) - 1, int(math.floor(peak)) + 3):
-                    # 基准 = 今日已实测到的最高值：守卫里的 net = gross - g 本来就是
-                    # "在已观测最高之上还能再升多少"，若仍从当前(已回落的)读数起算，
-                    # 等于把同一段回落罚了两次。
-                    base = hko_t if intraday_mx is None else max(hko_t, intraday_mx)
-                    need = b - base
+                # —— 日内外推：one-touch（时变障碍）+ 经验剩余升温分布 ——
+                # 结算量是**日内路径的最大值** → 连续监控的向上触碰，不是数字期权。
+                # 预测峰值 = max(已观测最高, 今日网格未来日变化最大值 + 当日水位 L)
+                #   L      = 实测 − 网格。今日水位**直接观测，不回归到气候均值**：
+                #           旧版 k = 气候偏差 − 当下偏差 会在干燥晴热天制造系统性偏冷
+                #           （当天偏差长期维持 +2.4 而不回到 +1.01，等于硬砍 1.4°C）。
+                #   g_rest = max(grid[t] for t ≥ 观测时刻)，用**今天模式自己**的日变化
+                #           曲线，不是气候平均——晚峰日（2026-09-08）也能给出真实剩余升温。
+                # 剩余不确定性取历史经验分位表：不假设正态、不需要手调"过峰守卫"。
+                # 午后 g_rest 单调下降，pred 会自然收敛到已观测最高（吸收态）。
+                # 今日水位 L：用**已采样时段的中位偏差**，不用单点。
+                # 单点会把 10 分钟级的站点抖动当成水位变化（13:20 L=+2.50 → 13:30 站点
+                # 掉 0.3°C 就变成 +2.20），直接污染 ρ̂ 与 δ。
+                L = robust_bias if len(devs) >= 3 else cur_bias
+                g_rest = max((v for h, v in grid_by_h.items() if h >= hh), default=None)
+                tbl = None
+                if rcdf:
+                    tbl = (rcdf.get('by_month', {}).get(str(now.month), {}).get(str(hh))
+                           or rcdf.get('by_hour', {}).get(str(hh)))
+                # 今天模式自己的日变化曲线，只以「相对气候升水的偏离 δ」进入：
+                # 气候升水已隐含在 R 的经验分布里，NWP 只贡献增量，点估计不当确定性用。
+                # δ 限幅 ±1.0°C——NWP 日变化本身也有误差，不能全信。
+                rho_hat = delta = 0.0
+                if g_rest is not None and intraday_mx is not None:
+                    rho_hat = (g_rest + L) - intraday_mx
+                    if tbl:
+                        delta = max(-1.0, min(1.0, rho_hat - tbl.get('mean', 0.0)))
+                pred = (max(float(intraday_mx), g_rest + L)
+                        if (g_rest is not None and intraday_mx is not None)
+                        else (float(intraday_mx) if intraday_mx is not None else None))
+                print(f"\n  📈 日内外推（one-touch：剩余升温经验分布）")
+                print(f"     实测{hko_t}°C / 网格{grid_now}°C → 今日水位 L = {L:+.2f}"
+                      f"（单点 {cur_bias:+.2f}，气候 {calib['bias']:+.2f}，均不回归）")
+                if g_rest is not None:
+                    print(f"     {hh}时后网格最高 {g_rest:.1f}°C（今日模式日变化）"
+                          f" → 站点预测 {g_rest + L:.2f}°C，"
+                          f"模式升水 ρ̂ = {rho_hat:+.2f}°C")
+                if pred is None:
+                    raise RuntimeError("无可用外推输入")
+                print(f"     ⇒ 今日峰值估计 {pred:.2f}°C（下限 = 已观测最高 {intraday_mx}°C）"
+                      f"  → 众数档 {int(math.floor(pred))}°C")
+                if tbl:
+                    print(f"     剩余升温分布: 经验分位 n={tbl['n']}，气候升水 "
+                          f"ρ̄={tbl.get('mean', 0):.2f}°C → δ={delta:+.2f}°C"
+                          f"（正态假设近端高估 41%、远端低估 3.4 倍）")
+                    print("     ⓘ 分位表基于 ERA5 网格，尾部比真实站点薄得多："
+                          "9月 h=13 的 P(剩余升温≥0.5) 网格 7.0% vs 机场站实测 32.8%（4.7 倍）。"
+                          "\n       以下概率是**下界**；站点口径约为其 2–5 倍，尾档尤其如此。")
+                lo_b = int(math.floor(intraday_mx)) if intraday_mx is not None \
+                    else int(math.floor(pred))
+                probs_out = {}
+                for b in range(lo_b, lo_b + 4):
                     if intraday_mx is not None and b <= intraday_mx:
-                        prob = 1.0   # 今日已实测到该温度，达成概率为 100%
-                    elif rise_sd > 0:
-                        z = (need - rise_m) / rise_sd
-                        prob = 1 - norm_cdf(z)
+                        probs_out[b] = 1.0
+                        print(f"        到 {b}.0°C  已实测达成  → 概率约 100%")
+                        continue
+                    need = b - (intraday_mx if intraday_mx is not None else hko_t)
+                    if tbl is not None and intraday_mx is not None:
+                        prob = cdf_upper(tbl, need - delta)
                     else:
-                        prob = 1.0 if need <= rise_m else 0.0
-                    print(f"        到 {b}.0°C 还需升 {need:+.1f}°C  "
-                          f"→ 概率约 {prob:.0%}")
+                        # 回退：气候表 + 正态（旧行为，仅当分位表缺失时）
+                        rm_ = d['mean'] + (calib['bias'] - cur_bias)
+                        prob = (1 - norm_cdf((need - rm_) / d['sd'])) if d['sd'] > 0 \
+                            else (1.0 if need <= rm_ else 0.0)
+                    probs_out[b] = prob
+                    print(f"        到 {b}.0°C  需再升 {need:+.1f}°C  → 概率约 {prob:.0%}")
+                _log_forecast(today, rt, hh, intraday_mx, pred, probs_out)
                 print("     ⚠️ 阴雨/雷暴日会显著低于此估计；若午后雨已到，以上即为上限")
     except Exception as e:
         print(f"  [日内外推跳过: {e}]")
@@ -596,10 +748,61 @@ def watch():
         print("  ⏰ 已过 16:00，晴天情形下日最高温基本锁定，剩余风险主要来自夜间暖平流")
     elif now.hour < 9:
         print("  🌅 早晨时段，日最高温通常在 14:00-16:00 出现，目前离锁定还很远")
+    print_next_refresh(now, now.date(), True)
     ex.shutdown(wait=False)
 
 
 # ---------------------------------------------------------------- 主流程
+def score():
+    """给历史预测打分：Brier + 可靠性分层。
+
+    这是 skill 的"体检报告"。没有它，模型偏差只能靠盘中人工发现——
+    2026-09-08（午后概率高估约 100 倍）到 09-10（上午系统性偏冷）连续三轮
+    都是事后复盘才抓到的。有了它，每次改完分位表/校准参数都能直接看分数变化。
+    """
+    p = os.path.join(DATA, 'forecast_log.jsonl')
+    if not os.path.exists(p):
+        print("没有 data/forecast_log.jsonl —— 先多跑几次 --watch 才会累积记录。")
+        return
+    obs = load_obs()
+    rows = [json.loads(l) for l in open(p, encoding='utf-8') if l.strip()]
+    scored = []
+    for r in rows:
+        try:
+            d = dt.date.fromisoformat(r['date'])
+        except (TypeError, ValueError):
+            continue
+        if d not in obs:
+            continue
+        for b, pr in r.get('probs', {}).items():
+            scored.append((r.get('hour', -1), float(b), float(pr),
+                           1.0 if obs[d] >= float(b) else 0.0))
+    if not scored:
+        print(f"日志 {len(rows)} 条，但都还没有对应实测值"
+              f"（HKO 官方逐日最高 bulk 有滞后，实测最新到 {max(obs) if obs else '—'}）。")
+        return
+    br = sum((a - b) ** 2 for _, _, a, b in scored) / len(scored)
+    print(f"\n预测打分  n={len(scored)} 条（{len(rows)} 次 watch × 档位）  总 Brier = {br:.4f}")
+    print("\n  按时点:")
+    by_h = {}
+    for h, _b, pr, y in scored:
+        by_h.setdefault(h, []).append((pr, y))
+    for h in sorted(by_h):
+        xs = by_h[h]
+        print("    %2d时  n=%4d  Brier=%.4f" % (
+            h, len(xs), sum((a - b) ** 2 for a, b in xs) / len(xs)))
+    print("\n  可靠性（预测区间 → 实际发生频率）:")
+    bins = {}
+    for _h, _b, pr, y in scored:
+        k = min(4, int(pr * 5))
+        s, c = bins.get(k, (0, 0))
+        bins[k] = (s + y, c + 1)
+    for k in sorted(bins):
+        s, c = bins[k]
+        print("    预测 %3.0f-%3.0f%%  n=%4d  实际 %5.1f%%"
+              % (k * 20, k * 20 + 20, c, 100 * s / c))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--date', help='目标日期 YYYY-MM-DD（香港日期）')
@@ -622,6 +825,8 @@ def main():
                          '（单次运行的耗时几乎全是握手，常驻只在第一次付这笔钱）')
     ap.add_argument('--loop-min', type=int, default=10, help='--loop 的间隔分钟数（默认 10）')
     ap.add_argument('--until', default='17:00', help='--loop 的停止时刻 HKT（默认 17:00）')
+    ap.add_argument('--score', action='store_true',
+                    help='给 data/forecast_log.jsonl 里的历史预测打分（Brier + 可靠性）')
     ap.add_argument('--recalibrate', action='store_true')
     ap.add_argument('--ttl', type=int, default=CACHE_TTL,
                     help=f'模式/预报类接口的缓存秒数（默认 {CACHE_TTL}s=15分钟；'
@@ -630,6 +835,10 @@ def main():
     ap.add_argument('--html', action='store_true', help='额外输出 HTML 报告')
     ap.add_argument('--version', action='version', version=f'hk-weather-edge {VERSION}')
     a = ap.parse_args()
+
+    if a.score:
+        score()
+        return
 
     if a.watch:
         if a.loop:
@@ -818,6 +1027,10 @@ def main():
 
     if a.html:
         write_html(results, calib, hko_map, market)
+
+    # 结论末尾固定提醒下次刷新：结论只在下一批新数据落地前有效
+    _tgt = dt.date.fromisoformat(a.date) if a.date else dt.datetime.now(TZ).date()
+    print_next_refresh(dt.datetime.now(TZ), _tgt, (a.date is None or a.date == today))
 
 
 def write_html(results, calib, hko_map, market):
