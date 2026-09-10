@@ -10,7 +10,36 @@
 递增版本号 → 在下面加一条 → 同步三处：`README.md` 顶部版本行、
 `SKILL.md` frontmatter 的 `version:`、`scripts/hk_edge.py` 的 `VERSION` 常量。
 
-当前版本：**v0.13.0**（`py -3 scripts/hk_edge.py --version` 可查）
+当前版本：**v0.13.1**（`py -3 scripts/hk_edge.py --version` 可查）
+
+---
+
+## v0.13.1 — 2026-09-10 · 修 v0.13.0 里让「长进闭环」空转的三处（PATCH）
+
+v0.13.0 引入的 `--score` 与站点序列归档，实际全都没能按设计工作。都是今天盘中发现的。
+
+1. **`--watch --loop` 在 Windows 下重定向输出就崩（P0，静默丢弃整个外推块）**
+   stdout 被 `>` 重定向时 Python 用 GBK，而输出里有 ⚠ / 📈，第一处就抛
+   `UnicodeEncodeError`。因为它发生在 `try` 内部，被就地吞成一行
+   `[日内外推跳过: ...]` —— **不报错、不退出，只是概率全没了**。
+   实测（09-10 13:50，`watch.bat >> watch.log`）：日志里就是
+   `[loop] 本次采集失败: UnicodeEncodeError`，当次采集完全作废。
+   现在 `main()` 在任何 print 之前把 stdout/stderr reconfigure 到 UTF-8 + `errors=replace`。
+   对照验证：`PYTHONIOENCODING=gbk` 下，v0.13.0 → `[日内外推跳过: 'gbk' codec...]`，
+   v0.13.1 → 完整输出 23 行。
+
+2. **站点序列归档只挂在「跨天」分支上，今天的数据永远进不了档**
+   `_archive_1min()` 只在发现日志日期 ≠ 今天时被调用，也就是说必须等明天跑一次
+   才把今天归档；明天若忘了跑，今天就永久丢失。改为每次采样后都调用
+   （函数自带长度比较，幂等）。`data/obs_1min_archive.json` 已开始累积
+   —— 这是把分位表从 ERA5 网格口径换成结算站口径的唯一途径。
+
+3. **`--score` 会被重复样本污染**：`forecast_log.jsonl` 只追加不判重，同一分钟内
+   手工跑两次 `--watch` 就写两条相同记录，样本量翻倍、Brier 被稀释。
+   现在同一 `(date, t)` 覆盖而非追加。
+
+顺带：本地 `model_calib.json` 已重校准（bias 1.008→1.007，n 86→83，窗口到 09-10），
+该文件在 `.gitignore` 内，不入库。
 
 ---
 

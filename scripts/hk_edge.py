@@ -26,7 +26,7 @@ Polymarket「香港最高气温」市场 Edge 计算器
 import argparse, json, math, os, sys, time, datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "0.13.0"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
+VERSION = "0.13.1"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
 
 # Kelly 缩放：满 Kelly 波动太大、且概率本身有 ±5% 量级误差，实操一律打折。
 # 这里用 35% Kelly（原来是 1/4=25%）。
@@ -382,12 +382,29 @@ def _log_forecast(day, ts, hour, rm, pred, probs):
     """
     if not probs:
         return
+    p = os.path.join(DATA, 'forecast_log.jsonl')
+    rec = {'date': day, 't': ts, 'hour': hour, 'rm': rm, 'pred': pred,
+           'probs': {str(k): round(v, 4) for k, v in probs.items()}}
     try:
-        with open(os.path.join(DATA, 'forecast_log.jsonl'), 'a', encoding='utf-8') as f:
-            f.write(json.dumps({'date': day, 't': ts, 'hour': hour, 'rm': rm,
-                                'pred': pred,
-                                'probs': {str(k): round(v, 4) for k, v in probs.items()}},
-                               ensure_ascii=False) + "\n")
+        # 同一 (date, t) 覆盖而不是追加：同一分钟内手工跑两次 --watch 会写两条一样的，
+        # 让 --score 重复计分、把样本量算翻倍。
+        lines = []
+        if os.path.exists(p):
+            for ln in open(p, encoding='utf-8'):
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    o = json.loads(ln)
+                except ValueError:
+                    continue
+                if o.get('date') == day and o.get('t') == ts:
+                    continue
+                lines.append(o)
+        lines.append(rec)
+        with open(p, 'w', encoding='utf-8') as f:
+            for o in lines:
+                f.write(json.dumps(o, ensure_ascii=False) + "\n")
     except Exception:
         pass
 
@@ -804,6 +821,15 @@ def score():
 
 
 def main():
+    # Windows 下 stdout 一旦被重定向（`> watch.log`）就用 GBK，输出里的 ⚠ / 📈
+    # 会直接抛 UnicodeEncodeError，把整个 --watch --loop 的采集打掉
+    # （2026-09-10 13:50 实测：loop 报 "本次采集失败: UnicodeEncodeError"，当次全废）。
+    # 必须在任何 print 之前修好。
+    for _s in (sys.stdout, sys.stderr):
+        try:
+            _s.reconfigure(encoding='utf-8', errors='replace')
+        except Exception:
+            pass
     ap = argparse.ArgumentParser()
     ap.add_argument('--date', help='目标日期 YYYY-MM-DD（香港日期）')
     ap.add_argument('--market', help='市场价，格式 "31:0.42,32:0.35"')
