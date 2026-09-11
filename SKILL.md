@@ -1,6 +1,6 @@
 ---
 name: hk-weather-edge
-version: 0.13.6
+version: 0.13.7
 description: Polymarket「香港最高气温」日度市场的 edge 计算与实况外推工具。把香港天文台(HKO)开放数据 + Open-Meteo 多模式 NWP 集合转为校准后的摄氏整数档(bucket)公允概率，并与市场价对比输出 EV 与 35% Kelly 仓位建议；`--watch` 模式基于结算站实测 + 日内气候曲线做当日峰值 nowcast。当用户提到「香港气温市场」「最高气温预测」「HKO / 天文台结算」「bucket 概率」「temperature bucket edge」「今天香港会到几度」「 polymarket weather Hong Kong」，或需要判断某个整数档是否值得买 YES / NO 时使用。
 ---
 
@@ -689,14 +689,35 @@ a\* 是「模型概率的最优权重」，用最小二乘最小化 Brier 估出
    - 只改文档 / 性能 / 修 bug 且**任何输出数字都不变** → PATCH
    - 新增功能或参数（向后兼容）→ MINOR
    - 结算口径、档位定义、核心算法改变 → MAJOR
-2. **同步三处版本号**（漏一处就会自相矛盾）
+2. **同步四处版本号**（漏一处就会自相矛盾）
    - `scripts/hk_edge.py` 的 `VERSION` 常量（`--version` 读它）
    - `SKILL.md` frontmatter 的 `version:`
    - `README.md` 顶部的「当前版本」行
+   - `CHANGELOG.md` 自己的「当前版本：」行（最容易漏的一处）
 3. **在 `CHANGELOG.md` 顶部加一条**：日期 + 一句话主题 + 要点（改了什么、为什么、
    **有没有改变输出数字**）。若数字会变，必须写明验证方式（例："优化前后逐位比对，最大差 0.00e+00"）。
-4. **提交并推送**：提交信息带版本号（`Release v0.5.0: ...`）；推完核对
-   本地 `git rev-parse --short HEAD` 与远端 `gh api repos/easonyeung1122-ops/hk-weather-edge/commits/main --jq .sha` 一致。
+4. **双副本同步：`cp` 的目标路径必须逐文件写全，不同目录的文件不许塞进同一条命令的同一个目标**
+   （2026-09-11 实际踩坑）。
+   两份副本：`.workbuddy/skills/hk-weather-edge`（活的工作副本）与
+   `.codebuddy/skills/hk-weather-edge`（git 源）。同步一律 `.workbuddy` → `.codebuddy`，方向别反。
+   ❌ 反例（会在根目录造出孤儿文件）：
+   ```bash
+   cp "$D/SKILL.md" "$D/README.md" "$D/CHANGELOG.md" "$D/scripts/hk_edge.py" "$S/"
+   ```
+   最后那个参数是 `$S/`（根目录），于是 `scripts/hk_edge.py` 被散到仓库根目录，
+   留下一个 58937 B 的未跟踪 `hk_edge.py`，此后每次 `git status` 都多一行 `??`。
+   ✅ 正例（按目标目录分两组）：
+   ```bash
+   cp "$D/SKILL.md" "$D/README.md" "$D/CHANGELOG.md" "$S/"
+   cp "$D/scripts/hk_edge.py" "$S/scripts/hk_edge.py"
+   ```
+   同步后用 `md5sum` 逐文件比对两份副本（四个文件全部 OK 才算同步成功）。
+5. **提交并推送**：只 `git add` 明确列出的目标文件（**不要 `git add -A` / `git add .`**），
+   提交信息带版本号（`Release v0.5.0: ...`）；推完核对本地 `git rev-parse --short HEAD`
+   与远端 `git ls-remote origin main` 一致（`gh` CLI 未认证，用 `git ls-remote` 代替）。
+6. **收尾自检**：`git status --short` 应只剩预期的 `M ...`，**不应出现任何 `??`**。
+   出现 `??` 说明有文件被散落到了错误位置，先查清来源再提交，必要时清理（可先确认该文件内容
+   在 git 历史中有无对应版本，有则可安全删除）。
 
 ## 合规与免责
 

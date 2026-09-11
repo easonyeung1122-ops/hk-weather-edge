@@ -10,7 +10,47 @@
 递增版本号 → 在下面加一条 → 同步三处：`README.md` 顶部版本行、
 `SKILL.md` frontmatter 的 `version:`、`scripts/hk_edge.py` 的 `VERSION` 常量。
 
-当前版本：**v0.13.6**（`py -3 scripts/hk_edge.py --version` 可查）
+当前版本：**v0.13.7**（`py -3 scripts/hk_edge.py --version` 可查）
+
+---
+
+## v0.13.7 — 2026-09-11 · 修好发版流程的路径陷阱，清理孤儿文件（PATCH）
+
+`hk_edge.py` 除版本号外一行未动，任何输出数字不变。改动全在 `SKILL.md`「发版流程」章节。
+
+### 背景：一个自己造成的孤儿文件
+
+仓库根目录出现了一份未跟踪的 `hk_edge.py`（58 937 B，`Sep 11 14:42`），
+内容是 **v0.13.5 时点的完整脚本**，与 `scripts/hk_edge.py` 的差异**只有 `VERSION` 一行**
+（`0.13.5` vs `0.13.6`）——是 v0.13.5 发版时同步命令的产物。
+
+**根因**：双副本同步命令把不同目录的文件塞进了同一个目标：
+
+```bash
+# ❌ 错误：最后那个参数是 $S/（根目录），于是 scripts 下的文件被散到仓库根
+cp "$D/SKILL.md" "$D/README.md" "$D/CHANGELOG.md" "$D/scripts/hk_edge.py" "$S/"
+```
+
+同批的 `SKILL.md` / `README.md` / `CHANGELOG.md` 本就该在根目录，等于原地覆盖自己、无害；
+唯独 `scripts/hk_edge.py` 成了散落孤儿。此后每次 `git status` 都多一行 `?? hk_edge.py`。
+
+### 处置
+
+- **文件已删除**。删除前已核对：其 md5 `99a2235ed36310bf0ab3eeef2331f199`
+  与 `git show 21d5f93:scripts/hk_edge.py` **逐位相同**，即内容在 git 历史中有完整对应，
+  删除**完全可逆**（`git show 21d5f93:scripts/hk_edge.py > hk_edge.py` 即可还原）。
+  该文件从未被 git 跟踪（`git log --all -- hk_edge.py` 为空），也未被任何脚本引用。
+
+### `SKILL.md`「发版流程」修订
+
+1. **第 4 步新增**（原 4 步扩为 6 步）：「双副本同步：`cp` 的目标路径必须逐文件写全，
+   不同目录的文件不许塞进同一条命令的同一个目标」——含本次踩坑的 ❌ 反例与 ✅ 正例，
+   并要求同步后用 `md5sum` 逐文件比对（四文件全 OK 才算成功）。
+2. **第 5 步新增**：只 `git add` 明确列出的目标文件，**不要 `git add -A` / `git add .`**；
+   推完用 `git ls-remote origin main` 核对（`gh` CLI 未认证）。
+3. **第 6 步新增**：收尾自检 `git status --short` 应只剩预期的 `M`，**不应出现任何 `??`**。
+4. **修正第 2 步**「同步三处版本号」→「**同步四处**」，补上最易漏的
+   `CHANGELOG.md` 自身的「当前版本：」行。
 
 ---
 
