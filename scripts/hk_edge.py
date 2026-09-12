@@ -26,7 +26,7 @@ Polymarket「香港最高气温」市场 Edge 计算器
 import argparse, json, math, os, sys, time, datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "0.13.7"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
+VERSION = "0.13.8"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
 
 # Kelly 缩放：满 Kelly 波动太大、且概率本身有 ±5% 量级误差，实操一律打折。
 # 这里用 35% Kelly（原来是 1/4=25%）。
@@ -875,8 +875,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--date', help='目标日期 YYYY-MM-DD（香港日期）')
     ap.add_argument('--market', help='市场价，格式 "31:0.42,32:0.35"')
+    # 注意：argparse 会对 help 字符串再做一次 %-格式化，因此 arg 里必须写 %%，
+    # 否则 `--help` 直接 ValueError: unsupported format character（0.13.7 前存在此 bug）
     ap.add_argument('--bankroll', type=float,
-                    help=f'本金(USDC)，给出 {KELLY_FRAC:.0%} Kelly 建议下注额')
+                    help=f'本金(USDC)，给出 {KELLY_FRAC*100:.0f}%% Kelly 建议下注额')
     ap.add_argument('--mu', type=float, help='手动覆盖点估计(°C)：把日内实况/官方预报按你的判断加权')
     ap.add_argument('--observed-max', type=float,
                     help='当日已实测到的最高温(°C)：分布截断重命名到该下限（默认自动读 --watch 日志）')
