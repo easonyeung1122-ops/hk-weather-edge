@@ -1,6 +1,6 @@
 # hk-weather-edge
 
-> 当前版本 **v0.15.1** —— 每次更新的改动见 [CHANGELOG.md](CHANGELOG.md)。
+> 当前版本 **v0.15.2** —— 每次更新的改动见 [CHANGELOG.md](CHANGELOG.md)。
 
 **每日建议战绩记分牌 → [PNL.md](PNL.md)**（逐日胜/负 + 累计 ROI + 逐腿归因，由 `scripts/rec_pnl.py` 生成）
 
