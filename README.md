@@ -1,6 +1,8 @@
 # hk-weather-edge
 
-> 当前版本 **v0.14.0** —— 每次更新的改动见 [CHANGELOG.md](CHANGELOG.md)。
+> 当前版本 **v0.15.0** —— 每次更新的改动见 [CHANGELOG.md](CHANGELOG.md)。
+
+**每日建议战绩记分牌 → [PNL.md](PNL.md)**（逐日胜/负 + 累计 ROI + 逐腿归因，由 `scripts/rec_pnl.py` 生成）
 
 CodeBuddy / Claude 技能包：Polymarket「香港最高气温」日度市场的 **edge 计算与实况外推**。
 

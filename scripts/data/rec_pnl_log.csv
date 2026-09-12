@@ -1,0 +1,25 @@
+﻿# 「每日交易建议」结算盈亏台账（recommendation ledger）
+# 说明：记录的是**建议**的结算盈亏，不是实际成交记录。金额 = 建议仓位，成交与否未知。
+# 口径：每条腿取「首推价 + 建议仓位」；同腿后续的加仓 / 改价不重复计入（避免同一论点重复计数）。
+#       若某腿在论点翻转后被重新推荐（如 9/11 的 NO32），仍算同一腿，只记首推。
+# 档位：N°C = [N.0, N+1.0)。YES N 赢 ⟺ 结算 = N；NO N 赢 ⟺ 结算 ≠ N。
+# 字段：settle_date 结算日 | leg 腿名 | side YES/NO | bucket 档位 | entry_price 首推可执行价
+#       cost_usd 建议投入(USDC) | shares 由 cost÷price 反推 | settle_bucket 实际结算档
+#       settle_status confirmed/provisional | outcome win/loss/open | note
+# 以 # 开头的行会被脚本忽略。
+# 未纳入台账：2026-09-07 / 09-08（skill 迭代期，只有单腿试探，未留结构化建议流水）
+# 未纳入台账：2026-09-10（结算日全天多次换腿：YES31 / NO32 / YES30 反复加仓 + NO31 卖出，建议流水未结构化留存，无法可靠还原）
+settle_date,leg,side,bucket,entry_price,cost_usd,settle_bucket,settle_status,outcome,note
+2026-09-09,NO31,NO,31,0.4700,277.30,32,confirmed,win,九月九日结算 32°C；唯一赢腿 +96%，覆盖其余四条亏损
+2026-09-09,YES30,YES,30,0.1921,155.00,32,confirmed,loss,同腿四次加仓 0.370→0.060 的均价口径（无单笔止损线）
+2026-09-09,NO32,NO,32,0.6500,130.00,32,confirmed,loss,只在上望 33 档时赢
+2026-09-09,YES29,YES,29,,11.00,32,confirmed,loss,份数未留存；输腿派息恒为 0，不影响汇总
+2026-09-09,YES33,YES,33,,4.00,32,confirmed,loss,同上
+2026-09-11,NO30,NO,30,0.7900,20.00,32,confirmed,win,
+2026-09-11,NO31,NO,31,0.5400,60.00,32,confirmed,win,当日最强腿 +85% ROI，落在 09:24–11:05 出仓窗口内
+2026-09-11,YES32,YES,32,0.3500,19.00,32,confirmed,win,
+2026-09-11,NO32,NO,32,0.0400,28.00,32,confirmed,loss,13:50 判「市场把 32 档高估」；20 分钟后站点实测 32.0 证伪
+2026-09-11,YES33,YES,33,0.0400,29.00,32,confirmed,loss,上望 33 档失败；两笔亏损都是边界已触及后仍赌右尾
+2026-09-12,YES31,YES,31,0.2800,15.00,32,provisional,loss,10:15 买「31 档便宜」；10:38 市场砸盘后浮亏 −61%
+2026-09-12,NO33,NO,33,0.7000,103.00,32,provisional,win,当日唯一赢腿 +$44.1；33 档全天未进入射程
+2026-09-12,NO32,NO,32,0.3600,80.00,32,provisional,loss,12:05 主腿；13:50 站点 32.6 后归零。同一论点另于 13:06 加挂 0.430（$29）未计入

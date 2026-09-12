@@ -1,6 +1,6 @@
 ---
 name: hk-weather-edge
-version: 0.14.0
+version: 0.15.0
 description: Polymarket「香港最高气温」日度市场的 edge 计算与实况外推工具。把香港天文台(HKO)开放数据 + Open-Meteo 多模式 NWP 集合转为校准后的摄氏整数档(bucket)公允概率，并与市场价对比输出 EV 与 35% Kelly 仓位建议；`--watch` 模式基于结算站实测 + 日内气候曲线做当日峰值 nowcast。当用户提到「香港气温市场」「最高气温预测」「HKO / 天文台结算」「bucket 概率」「temperature bucket edge」「今天香港会到几度」「 polymarket weather Hong Kong」，或需要判断某个整数档是否值得买 YES / NO 时使用。
 ---
 
@@ -424,6 +424,9 @@ py -3 scripts/analyze.py                 # 站点偏差、月度气候、日际�
 | `scripts/hitrate.py` | 命中率与 `floor` 取整错配分析（需要 pandas + numpy） |
 | `scripts/build_remaining_rise.py` | **重建剩余升温经验分位表**（one-touch 口径），`--validate` 附新旧 Brier 对照 |
 | `scripts/review_brier.py` | **收盘复盘**：`decision_log.csv` 逐时点算「模型 vs 市场」Brier，按上午/午后分层。结算档默认读 `maxt_HKO.csv`，近期日需 `--truth DATE=N`；`--flicker` 改算 σ_flicker 与越线概率表 |
+| `scripts/rec_pnl.py` | **建议盈亏台账**：读 `rec_pnl_log.csv` 出「逐日胜/负 + 累计 ROI + 按方向拆分」。`--settle DATE=N --write` 回填结算档，`--markdown` 重生 `PNL.md` |
+| `scripts/data/rec_pnl_log.csv` | 每日建议腿的台账（**纳入 git**）。一条腿一行，取首推价 + 建议仓位；口径见《每日建议台账》 |
+| `PNL.md` | 台账的 GitHub 可见记分牌（由 `rec_pnl.py --markdown` 生成，勿手改） |
 | `scripts/data/remaining_rise_cdf.json` | 剩余升温 `R = M − 已观测最高` 的经验分位表（按月×时，ERA5 4266 天） |
 | `scripts/data/forecast_log.jsonl` | 每次 `--watch` 落地的概率向量，`--score` 用它打 Brier |
 | `scripts/data/obs_1min_archive.json` | 0.1°C 结算站序列**按日归档**，攒够后可重建站点口径分位表 |
@@ -861,6 +864,71 @@ a\* 是「模型概率的最优权重」，用最小二乘最小化 Brier 估出
 **待办**：① 把它并进 `remaining_rise_cdf.json` 的使用路径（现在分位表只含趋势项、不含抖动）；
 ② 在 `--watch` 里对 d ≤ 0.3 直接打「抖动主导」标记并**不输出概率**（避免再出现「给 9%」这种数）；
 ③ 补齐 `obs_1min_archive.json` 的每日归档 —— σ 目前只有 2 天样本。
+
+## 每日建议台账：胜 / 负与累计 ROI（v0.15.0）
+
+**问题**：每天给出去的建议，整体是赚还是亏？此前这个问题没有答案 —— 逐日复盘散落在会话记录里，
+既不能累计，也无法回答「这套方法长期有效吗」。
+
+**台账文件** `scripts/data/rec_pnl_log.csv`（**已纳入 git**，与 `.gitignore` 掉的 `decision_log.csv` 不同）。
+一条腿一行；以 `#` 开头的行是口径说明，脚本会跳过。
+
+| 字段 | 含义 |
+|---|---|
+| `settle_date` | 结算日（= 目标日） |
+| `leg` / `side` / `bucket` | 腿名 / `YES`·`NO` / 档位 N（`N°C = [N.0, N+1.0)`） |
+| `entry_price` | **首推可执行价** |
+| `cost_usd` | 建议投入（USDC）；份数由 `cost ÷ price` 反推 |
+| `settle_bucket` / `settle_status` | 实际结算档 / `confirmed`·`provisional` |
+| `outcome` | `win` / `loss` / `open` |
+| `note` | 一句话事后归因 |
+
+**计入口径（重要，防止自我美化）**
+
+1. **每条腿只记一次**：取「**首推价 + 建议仓位数**」。同一条腿后续的加仓、改价、换价重新推荐
+   一律不重复计入 —— 否则同一论点被反复计数，且加仓价通常优于首推价，会造出虚假盈利。
+2. 论点翻转后重新建仓（如 9/11 的 NO32 先押「不是 32」、后押「高于 32」）**仍算同一条腿**。
+3. **记录的是建议，不是成交**。实际成交量受订单簿深度限制（薄盘常只能成交建议额的 20–40%），
+   所以台账是**收益上限口径**：真金白银的波动小于表内数字，但**符号（胜 / 负）不受影响**。
+4. **未结构化留存的日期不硬凑**：9/07–9/08（迭代期只有单腿试探）、9/10（结算日全天多次换腿，
+   流水无法可靠还原）在 CSV 里以 `# 未纳入台账` 注明，宁可空着。
+
+**工具**
+
+```bash
+py -3 scripts/rec_pnl.py                                   # 逐日汇总 + 总计 + 累计曲线 + 按方向拆分
+py -3 scripts/rec_pnl.py --open                            # 只列未结算的腿
+py -3 scripts/rec_pnl.py --settle 2026-09-12=32 --write    # 回填结算档（近期日唯一可靠途径）
+py -3 scripts/rec_pnl.py --auto --write                    # 用 maxt_HKO.csv（结算源，滞后约 10 天）回填
+py -3 scripts/rec_pnl.py --markdown                        # 重新生成仓库根目录 PNL.md
+```
+
+`--settle` 默认**只试算不落盘**，加 `--write` 才写回 CSV。口径细节见 `PNL.md`。
+
+**当前战绩（含 13 条腿 / 3 个结算日）**
+
+| 结算日 | 结算档 | 腿 | 胜-负 | 投入 | 净盈亏 | ROI | 当日 |
+|---|---|---:|---:|---:|---:|---:|:--:|
+| 09-09 | 32°C | 5 | 1-4 | $577.30 | +$12.70 | +2.2% | 盈 |
+| 09-11 | 32°C | 5 | 3-2 | $156.00 | +$34.71 | +22.3% | 盈 |
+| 09-12 | 32°C * | 3 | 1-2 | $198.00 | −$50.86 | −25.7% | 亏 |
+| **合计** | | **13** | **5-8** | **$931.30** | **−$3.44** | **−0.4%** | 2 盈 / 1 亏 |
+
+`*` 结算档暂定。**按方向拆开才看得清**：`NO` 7 腿 4-3、ROI **+25.1%**；
+`YES` 6 腿 **1-5**、ROI **−76.7%**。YES 这 5 笔亏损里，有 5 笔是「上望更高一档」的右尾注
+（YES30 / YES29 / YES33 ×2 / YES31）—— 与《峰值窗口内不要钉档位》《σ_flicker》两节同源：
+**在上升趋势里押注封顶、或押注冲高，是这套方法目前唯一稳定的亏损来源；而盈利几乎全部来自
+「顺已确立方向做 NO」。**
+
+**每日收盘必做（漏一天就永久断档，补不回来）**
+
+1. 当日所有给出建议的腿写入 `rec_pnl_log.csv`，`outcome` 先留 `open`；
+2. 结算档出来后 `--settle YYYY-MM-DD=N --write`；
+3. `--markdown` 重新生成 `PNL.md`；
+4. 按《发版流程》同步双副本并推送。
+
+> **样本限制（如实说明）**：3 个结算日 / 13 条腿，**无统计显著性**，且 9/09 与 9/11 结算档相同、
+> 市场状态高度相关。台账的价值是**逼出可复盘的归因**，不是给方法打分。攒到 20+ 个结算日再谈胜率。
 
 ## 发版流程（每次推送 GitHub 前必做）
 
