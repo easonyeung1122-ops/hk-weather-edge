@@ -23,6 +23,7 @@ import collections
 import csv
 import datetime as dt
 import json
+import math
 import os
 import sys
 
@@ -30,6 +31,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(HERE, 'data')
 LOG = os.path.join(DATA, 'decision_log.csv')
 MAXT = os.path.join(DATA, 'maxt_HKO.csv')
+ARCHIVE = os.path.join(DATA, 'obs_1min_archive.json')
+TODAY_LOG = os.path.join(DATA, 'obs_1min_log.json')
 
 # 上午 / 午后 分界（与 SKILL.md「出仓窗口 09:00–11:30」一致）
 MORNING_CUTOFF_HOUR = 12
@@ -103,12 +106,92 @@ def hour_of(tstr):
         return None
 
 
+def _phi(x):
+    return 0.5 * (1 + math.erf(x / math.sqrt(2)))
+
+
+def _load_station_series():
+    """→ [(label, [(HH:MM, temp), ...]), ...]，来源：当日 obs_1min_log + obs_1min_archive。"""
+    out = []
+    if os.path.exists(TODAY_LOG):
+        j = json.load(open(TODAY_LOG, encoding='utf-8'))
+        out.append((j.get('date', '?'),
+                    [(p['t'][11:16], p['hko']) for p in j.get('points', [])]))
+    if os.path.exists(ARCHIVE):
+        a = json.load(open(ARCHIVE, encoding='utf-8'))
+        for day, pts in sorted(a.items()):
+            out.append((day, [(p['t'][11:16], p['hko']) for p in pts]))
+    return out
+
+
+def cmd_flicker(from_hhmm='12:30'):
+    """σ_flicker：站点午后 10 分钟级抖动。
+
+    为什么需要它：分位表 `remaining_rise_cdf.json` 是 ERA5 **网格**口径，
+    网格（9–31 km 空间平均）把单点的局地抖动抹平了。于是「已观测最高距下一整数档
+    只剩 0.1–0.3 °C」这种情形，网格口径看起来是稀有事件（≈9%），
+    而真实站点在 10 分钟内就能抖过去（≈99%）。
+    2026-09-11 / 09-12 两天的实盘：市场按抖动定价（97% / 99.85%），我们按网格定价（25% / 9%），
+    市场两次都对。
+    """
+    series = _load_station_series()
+    if not series:
+        print('[warn] 没有站点序列（obs_1min_log.json / obs_1min_archive.json 都缺）')
+        return 1
+    sds = []
+    print('=' * 78)
+    print('σ_flicker —— 站点午后（%s 后）10 分钟相邻差分' % from_hhmm)
+    print('（只取间隔恰为 10 分钟的对，避免混入 20/30 分钟的跨度）\n')
+    for label, pts in series:
+        seq = [(t, v) for t, v in pts if t >= from_hhmm]
+        diffs = []
+        for (t1, v1), (t2, v2) in zip(seq, seq[1:]):
+            h1, m1 = map(int, t1.split(':'))
+            h2, m2 = map(int, t2.split(':'))
+            if (h2 * 60 + m2) - (h1 * 60 + m1) == 10:
+                diffs.append(v2 - v1)
+        if len(diffs) < 2:
+            print(f'{label}  样本不足 (n={len(diffs)})，跳过')
+            continue
+        mu = sum(diffs) / len(diffs)
+        sd = (sum((d - mu) ** 2 for d in diffs) / len(diffs)) ** 0.5
+        sds.append(sd)
+        print(f'{label}  n={len(diffs)}  均值 {mu:+.3f}  σ = {sd:.3f} °C  '
+              f'最大单步 {max(abs(d) for d in diffs):.1f}')
+        print(f'   {[f"{v:.1f}" for _, v in seq]}')
+    if not sds:
+        return 1
+    sig = sum(sds) / len(sds)
+    print(f'\n→ 合并 σ_flicker = {sig:.3f} °C（{len(sds)} 天；注意 σ 随天气型变化，晴热静风日最大）')
+
+    print('\n' + '=' * 78)
+    print(f'距下一整数档还需 d °C 时，「剩余窗口内至少越线一次」的概率（N(0, σ={sig:.3f})）')
+    print(f'{"d":>5} | {"单步":>7} | {"剩 6 步":>8} | {"剩 10 步":>8} | {"剩 15 步":>8} | 判读')
+    print('-' * 78)
+    for d in (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.8, 1.0):
+        p1 = 1 - _phi(d / sig)
+        row = [1 - (1 - p1) ** n for n in (6, 10, 15)]
+        note = ('★ 抖动主导：禁止反向下注' if d <= 0.3 else
+                '过渡区：按 0.5 折' if d < 0.6 else '分位表可用（抖动项 <30%）')
+        print(f'{d:>5.1f} | {p1:>7.1%} | {row[0]:>8.1%} | {row[1]:>8.1%} | {row[2]:>8.1%} | {note}')
+    print('\n对照（分位表 = ERA5 网格口径，不含抖动）：h=13 需再升 +0.1 → 约 9%；+0.4 → 约 0-1%。')
+    print('→ 网格口径在 d ≤ 0.3 时低估 1–2 个数量级。')
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description='decision_log 的 Brier 时间分层复盘')
     ap.add_argument('--truth', default='',
                     help='覆盖结算档，格式 "2026-09-11=32,2026-09-12=32"（默认读 maxt_HKO.csv，可含本日实测下限）')
+    ap.add_argument('--flicker', action='store_true',
+                    help='不算 Brier，改算站点午后 10 分钟抖动 σ_flicker 与越线概率表')
+    ap.add_argument('--from', dest='from_hhmm', default='12:30',
+                    help='--flicker 的午后起点（默认 12:30）')
     ap.add_argument('--json', action='store_true', help='输出 JSON')
     a = ap.parse_args()
+
+    if a.flicker:
+        return cmd_flicker(a.from_hhmm)
 
     settled = load_settled()
     settled.update(parse_truth(a.truth))
