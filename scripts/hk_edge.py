@@ -26,11 +26,39 @@ Polymarket「香港最高气温」市场 Edge 计算器
 import argparse, json, math, os, sys, time, datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "0.15.3"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
+VERSION = "0.15.4"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
 
 # Kelly 缩放：满 Kelly 波动太大、且概率本身有 ±5% 量级误差，实操一律打折。
 # 这里用 35% Kelly（原来是 1/4=25%）。
 KELLY_FRAC = 0.35
+
+# ---- σ_flicker：站点午后 10 分钟级抖动（v0.15.4）----
+# 分位表 remaining_rise_cdf.json 是 ERA5 **网格**口径，网格（9–31 km 空间平均）把单点的
+# 局地抖动抹平了。于是「已观测最高距下一整数线只剩 0.1–0.4 °C」在网格口径下看似稀有
+# （≈0–9%），而真实站点在 10 分钟内就能抖过去（实测 13:40→13:50 +0.9 °C）。
+# 2026-09-11 / 09-12 两天实盘：市场按抖动定价（97% / 99.85%），我们按网格定价（25% / 9%），
+# 市场两次都对。→ 近边界处**网格公允值在最贵的一侧系统性偏乐观**。
+# 样本限制：σ 只有 2 天 / 30 个差分、越线 2 例未越线 1 例，σ 随天气型变化。
+# **所以只当「d ≤ 0.4 时网格公允值不可用」的开关用，不做精细概率输出。**
+SIGMA_FLICKER = 0.355     # °C，站点午后 10 分钟相邻差分（review_brier.py --flicker）
+PEAK_HOUR = 15.5          # 9 月晴天的最后一个尖峰窗口（见 SKILL.md《等最后一个尖峰》）
+
+
+def flicker_p_cross(d, steps_left, sigma=SIGMA_FLICKER):
+    """剩余窗口内「至少越线一次」的概率（零漂移随机游走，表值是上界）。
+
+    d = 已观测最高 → 下一整数线的距离；steps_left = 剩余 10 分钟步数。
+    同 review_brier.py --flicker 的口径，供近边界处的守卫使用。
+    """
+    if d <= 0:
+        return 1.0
+    p1 = 1.0 - 0.5 * (1 + math.erf((d / sigma) / math.sqrt(2)))
+    return 1.0 - (1.0 - p1) ** max(1, int(steps_left))
+
+
+def flicker_steps_left(now_hour_frac, peak_hour=PEAK_HOUR):
+    """到峰值窗口结束还剩多少个 10 分钟步。"""
+    return max(1, int(round((peak_hour - now_hour_frac) * 6)))
 
 # ---- HTTP 层 ----
 # 一次运行要打 3~4 个互不依赖的接口，串行时耗时几乎全是 TLS 握手（实测 2.2s ≈ 3×0.7s）。
@@ -889,6 +917,10 @@ def main():
                          '（默认 -0.15，含义是市价已明显高于公允值，持有人该检查止盈）')
     ap.add_argument('--hold', help='已持有头寸 "档位:成本价:份数[:Y|N],..."（N=持有 NO），'
                                    '例 "34:0.065:200,33:0.56:70:N" → 输出浮盈与止盈建议')
+    ap.add_argument('--steps-left', type=int, default=None,
+                    help='σ_flicker 守卫用的剩余 10 分钟步数（默认按当前时刻算到 15:30）。'
+                         '盘后想复现当天盘中某时刻的守卫结论时必须显式给，否则按"现在"算'
+                         '（当天已无剩余窗口 → 守卫自动失效）。守卫只对当日生效。')
     ap.add_argument('--watch', action='store_true', help='当日实时追踪')
     ap.add_argument('--loop', action='store_true',
                     help='配合 --watch：常驻进程内反复采集，复用同一条 TLS 连接'
@@ -1045,6 +1077,46 @@ def main():
     if a.hold:
         t0 = targets[-1]
         r0 = results[t0]
+        # ---- σ_flicker 守卫（v0.15.4）----
+        # 当日已观测最高落在 b0 档、距下一整数线 d 很小时，分位表（ERA5 网格）在近端
+        # 低估越线 1–2 个数量级 → **网格公允值在最贵的那一侧系统性偏乐观**。
+        # 不修这一处，持仓检查会给出与事实相反的结论：9/12 14:00 的 NO33 网格公允 ≈100%、
+        # 现价 0.93 → 判「持有观察」，两小时后归零。真实越线概率当时 ≈75%。
+        fl_b0 = fl_d = fl_pc = fl_grid_pc = fl_pc_use = None
+        fl_regime = None
+        if floor_max is not None and _floor_applies:
+            if a.steps_left is not None:
+                _steps = max(1, a.steps_left)
+                _src = f'--steps-left {_steps}'
+            else:
+                _n = dt.datetime.now()
+                _steps = flicker_steps_left(_n.hour + _n.minute / 60.0)
+                _src = f'按当前时刻算到 {PEAK_HOUR:.1f} 时 → {_steps} 步'
+            fl_b0 = int(math.floor(floor_max))
+            fl_d = (fl_b0 + 1) - floor_max
+            fl_pc = flicker_p_cross(fl_d, _steps)
+            fl_grid_pc = 1.0 - r0['probs'].get(fl_b0, 1.0)
+            # 合并规则恒取 max，不分档：站点 = 网格 + 单点额外方差，分布单调加宽
+            # → 真值 ≥ 两个口径各自单算。分档只用于决定"网格表值还能不能信"。
+            fl_pc_use = max(fl_pc, fl_grid_pc)
+            if fl_pc >= 0.70:
+                fl_regime = '抖动主导'
+            elif fl_pc >= 0.30:
+                fl_regime = '过渡区'
+            else:
+                fl_regime = '分位表可用'
+            print(f"\n  σ_flicker 守卫：已观测最高 {floor_max}°C 落在 {fl_b0}°C 档，"
+                  f"距下一整数线 d={fl_d:.1f}")
+            print(f"    剩余 {_steps} 步（{_src}）「至少越线一次」："
+                  f"网格 {fl_grid_pc:.1%}｜抖动 {fl_pc:.1%} → 采用 {fl_pc_use:.1%}（{fl_regime}）")
+            if fl_regime == '分位表可用':
+                print("    → 抖动项 <30%，守卫不动作，下表按常规读。")
+            else:
+                print(f"    → 「{fl_b0 + 1}°C 档的 NO」与「{fl_b0}°C 档的 YES」在这两侧网格表值"
+                      f"偏乐观（= 押封顶会亏）；另两侧（NO {fl_b0} / YES {fl_b0 + 1}）反被低估。")
+                print("    ⚠ σ_flicker 只有 2 天 / 30 个差分样本 → 表值是上界，只作开关。")
+                print("    ⓘ 上方「公允P」列仍是网格口径（未覆盖）——保守方向：新开仓的 edge "
+                      "会被低估，不会被高估。")
         print(f"\n■ 持仓检查 {t0}（止盈阈值：现在买入 EV ≤ {-a.exit_ev:.0%}）")
         print(f"  {'头寸':>10} {'份数':>7} {'成本':>7} {'现价':>7} {'浮盈':>8} {'公允':>8} "
               f"{'现在买入EV':>10}   建议")
@@ -1068,13 +1140,29 @@ def main():
                 continue
             cur = mk if side != 'N' else 1 - mk
             pnl = (cur - ent) / ent if ent > 0 else 0.0
+            # —— 近边界处用抖动口径覆盖网格公允值（0.70/0.30 阈值见 SKILL.md）——
+            ovr = ''
+            if fl_regime is not None and fl_regime != '分位表可用':
+                pc = fl_pc_use
+                if side != 'N' and b == fl_b0:
+                    fair = 1 - pc                                   # YES b0：越线即输
+                elif side == 'N' and b == fl_b0 + 1:
+                    fair = 1 - pc                                   # NO b0+1：押「封顶」即输
+                elif side == 'N' and b == fl_b0:
+                    fair = pc                                       # NO b0：越线反而赢
+                elif side != 'N' and b == fl_b0 + 1:
+                    fair = pc                                       # YES b0+1：越线才赢
+                else:
+                    pc = None
+                if pc is not None:
+                    ovr = f"〔{fl_regime}：公允值已用抖动口径覆盖〕"
             ev_now = fair / cur - 1 if cur > 0 else 0.0
             if ev_now <= -a.exit_ev:
-                adv = f"⚠ 止盈（现价高出公允 {-ev_now:.0%}）"
+                adv = f"⚠ 止盈（现价高出公允 {-ev_now:.0%}）{ovr}"
             elif ev_now >= 0.08:
-                adv = f"仍低估 {ev_now:.0%} → 持有/可加仓"
+                adv = f"仍低估 {ev_now:.0%} → 持有/可加仓{ovr}"
             else:
-                adv = "持有观察（edge 不足）"
+                adv = f"持有观察（edge 不足）{ovr}"
             name = f"{b}°C {'YES' if side != 'N' else 'NO '}"
             print(f"  {name:>10} {sh:>7.0f} {ent:>7.3f} {cur:>7.3f} {pnl:>+8.0%} "
                   f"{fair:>8.1%} {ev_now:>+10.0%}   {adv}")
