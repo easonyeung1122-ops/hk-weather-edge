@@ -26,7 +26,7 @@ Polymarket「香港最高气温」市场 Edge 计算器
 import argparse, json, math, os, sys, time, datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "0.15.5"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
+VERSION = "0.15.6"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
 
 # Kelly 缩放：满 Kelly 波动太大、且概率本身有 ±5% 量级误差，实操一律打折。
 # 这里用 35% Kelly（原来是 1/4=25%）。
@@ -42,6 +42,15 @@ KELLY_FRAC = 0.35
 # **所以只当「d ≤ 0.4 时网格公允值不可用」的开关用，不做精细概率输出。**
 SIGMA_FLICKER = 0.355     # °C，站点午后 10 分钟相邻差分（review_brier.py --flicker）
 PEAK_HOUR = 15.5          # 9 月晴天的最后一个尖峰窗口（见 SKILL.md《等最后一个尖峰》）
+
+# ---- σ_δ：模式升水的不确定性（v0.15.6）----
+# one-touch 外推里 ρ̂ = (网格剩余最高 + 水位 L) − 已观测最高，是 NWP 日变化与 L 的合成量。
+# 旧版把 δ=ρ̂−ρ̄ 当**确定量**平移经验分布，当 δ>need 时阈值穿到分位表最小值(0)以下
+# → cdf_upper 返回 1−q[0][0]=99%（伪确定性，见 cdf_upper_delta）。
+# 2026-09-13 实测：need=0.6、δ=0.77 → 报 99%，当时站点已横盘 2h，可辩护值 ~50–68%。
+# 把 δ 的 1σ 取成**与 δ 成比例**（相对误差 80%）：δ 小 → 不确定小，早晨窗口行为几乎不变；
+# δ 大 → 不确定同比例放大，自动消除 δ>need 的饱和。比「δ>0.3 才卷积」的硬阈值平滑。
+DELTA_REL_SIGMA = 0.8     # δ 的相对 1σ（乘 |δ| 得 °C）
 
 
 def flicker_p_cross(d, steps_left, sigma=SIGMA_FLICKER):
@@ -590,6 +599,27 @@ def cdf_upper(tbl, x):
     return 0.0
 
 
+def cdf_upper_delta(tbl, x, sigma):
+    """把模式升水当**随机量**的上尾概率：R_today = R_hist + Δ，Δ ~ N(δ, sigma²)。
+
+    旧式 `cdf_upper(tbl, need − δ)` 把 δ 当确定量整体平移，会在 δ > need 时把阈值推到
+    分位表最小值(0)以下 → 返回 1−q[0][0] = 99%，等价于「今天几乎必然再升 δ」。这抹掉了
+    分位表在 R=0 处的原子（h≥13 有 ~60% 的日子当天最高已经出现），是伪确定性。
+
+    这里对 ε ~ N(0, sigma²) 求平均 E[cdf_upper(tbl, x − ε)]（x = need − δ）。
+    σ→0 退化为旧行为；σ>0 时原子被展宽，δ>need 不再饱和到 99%。
+    """
+    if not tbl or sigma <= 0:
+        return cdf_upper(tbl, x)
+    ng, acc, ws = 25, 0.0, 0.0
+    for i in range(ng):
+        z = (i - (ng - 1) / 2.0) / ((ng - 1) / 2.0) * 2.2     # z ∈ [−2.2, 2.2]
+        w = math.exp(-0.5 * z * z)
+        acc += w * cdf_upper(tbl, x - sigma * z)
+        ws += w
+    return acc / ws
+
+
 def watch():
     """实时追踪：记录当日天文台站已观测到的最高温度（供 cron 每 10 分钟调用）"""
     now = dt.datetime.now(TZ)
@@ -763,6 +793,9 @@ def watch():
                     print(f"     剩余升温分布: 经验分位 n={tbl['n']}，气候升水 "
                           f"ρ̄={tbl.get('mean', 0):.2f}°C → δ={delta:+.2f}°C"
                           f"（正态假设近端高估 41%、远端低估 3.4 倍）")
+                    if abs(delta) > 0.3:
+                        print(f"     ⓘ δ 按随机量处理（1σ={DELTA_REL_SIGMA:.1f}×|δ| 卷积）："
+                              "δ>need 时不再饱和到 99%，见 cdf_upper_delta")
                     print("     ⓘ 分位表基于 ERA5 网格，尾部比真实站点薄得多："
                           "9月 h=13 的 P(剩余升温≥0.5) 网格 7.0% vs 机场站实测 32.8%（4.7 倍）。"
                           "\n       以下概率是**下界**；站点口径约为其 2–5 倍，尾档尤其如此。")
@@ -776,7 +809,9 @@ def watch():
                         continue
                     need = b - (intraday_mx if intraday_mx is not None else hko_t)
                     if tbl is not None and intraday_mx is not None:
-                        prob = cdf_upper(tbl, need - delta)
+                        # δ 当随机量（1σ = DELTA_REL_SIGMA×|δ|），消除 δ>need 的 99% 饱和
+                        prob = cdf_upper_delta(tbl, need - delta,
+                                               DELTA_REL_SIGMA * abs(delta))
                     else:
                         # 回退：气候表 + 正态（旧行为，仅当分位表缺失时）
                         rm_ = d['mean'] + (calib['bias'] - cur_bias)
