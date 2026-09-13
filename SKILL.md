@@ -1,6 +1,6 @@
 ---
 name: hk-weather-edge
-version: 0.15.7
+version: 0.15.8
 description: Polymarket「香港最高气温」日度市场的 edge 计算与实况外推工具。把香港天文台(HKO)开放数据 + Open-Meteo 多模式 NWP 集合转为校准后的摄氏整数档(bucket)公允概率，并与市场价对比输出 EV 与 35% Kelly 仓位建议；`--watch` 模式基于结算站实测 + 日内气候曲线做当日峰值 nowcast。当用户提到「香港气温市场」「最高气温预测」「HKO / 天文台结算」「bucket 概率」「temperature bucket edge」「今天香港会到几度」「 polymarket weather Hong Kong」，或需要判断某个整数档是否值得买 YES / NO 时使用。
 ---
 
@@ -478,6 +478,22 @@ py -3 scripts/hk_edge.py --date <今日> --bankroll <本金> \
 
 **如果用户没给头寸**：照常出公允概率与仓位建议，但**不要猜他的持仓**，
 并明确说一句「没收到头寸，本轮不做止盈检查」。
+
+## 接口字段速查（手工取数时踩过的坑）
+
+调试或手工复核要直接打接口时，先记住这三条，否则第一次调用一定拿不到数：
+
+1. **Open-Meteo 多模式**：请求 `models=a,b,c` 时，`daily` 里的键会**带上模式后缀** ——
+   `temperature_2m_max_ecmwf_ifs025`、`precipitation_sum_gfs_seamless` …，
+   **不是** `temperature_2m_max`。顶层也不再有各模式的子字典（那是单模式才有的形状）。
+   写成 `d['daily']['temperature_2m_max']` 会 `KeyError`。
+2. **HKO 九天预报 `fnd`**：字段名是 **`forecastMaxtemp`**（小写 t）+ 嵌套 `{value, unit}`，
+   **不是** `forecastMaxTemp` / `forecastMaxTemperature`；温度没有扁平字段。
+   取 `w['forecastMaxtemp']['value']`。`forecastDate` 是 `YYYYMMDD` 字符串，
+   **当日的条目可能已从列表移除**，只有未来 9 天。
+3. **HKO CLMMAXT**：`rformat=csv` 时首行是 `\ufeff` BOM + 中文标题，含 3 行表头，
+   末尾两行是 `*** 沒有數據` / `# 數據不完整` 图例 —— 解析要按列位取 `year,month,day,value,completeness`，
+   别把图例行当数据。**该源滞后约 10 天**（9 月中旬只能取到 8/31）。
 
 ## 数据 / 脚本清单
 

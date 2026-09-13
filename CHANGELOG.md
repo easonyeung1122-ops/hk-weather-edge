@@ -11,7 +11,26 @@
 `SKILL.md` frontmatter 的 `version:`、`scripts/hk_edge.py` 的 `VERSION` 常量、
 以及**本文件下面的「当前版本」行**（最容易漏的一处）。
 
-当前版本：**v0.15.7**（`py -3 scripts/hk_edge.py --version` 可查）
+当前版本：**v0.15.8**（`py -3 scripts/hk_edge.py --version` 可查）
+
+---
+
+## v0.15.8 — 2026-09-13 · SKILL.md 补《接口字段速查》：三个数据源的字段陷阱（PATCH）
+
+**不改变任何输出数字**（纯文档）。在 `SKILL.md` 加一节《接口字段速查（手工取数时踩过的坑）》，
+收录手工复核取数时的三个坑 —— 不写清楚，下次直连接口第一次调用就 `KeyError`：
+
+1. **Open-Meteo 多模式**：`models=a,b,c` 时 `daily` 的键**带模式后缀**
+   （`temperature_2m_max_ecmwf_ifs025`…），且**没有**顶层各模式子字典（那是单模式才有的形状）。
+2. **HKO 九天预报 `fnd`**：字段名是 `forecastMaxtemp`（**小写 t**）+ 嵌套 `{value, unit}`；
+   `forecastDate` 为 `YYYYMMDD` 字符串，**当日的条目可能已从列表移除**（只剩未来 9 天）。
+3. **HKO `CLMMAXT`**：`rformat=csv` 首行是 BOM + 中文标题，含 **3 行表头**，
+   末两行是 `*** 沒有數據` / `# 數據不完整` 图例（别当数据行）；**该源滞后约 10 天**
+   （9 月中旬只能取到 8/31）。
+
+台账部分本次**无新增腿、无档位变更**：9/13 唯一腿 **YES28** 已于当日回填，结算 **31°C**（`provisional`）。
+复查时间 **2026-09-13 21:31**，官方 Daily Extract 仍只到 **09-10**，故 09-11 / 09-12 / 09-13
+三日继续保持 `provisional`，未转 `confirmed`。
 
 ---
 
