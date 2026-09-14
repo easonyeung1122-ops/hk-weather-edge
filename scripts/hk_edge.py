@@ -23,10 +23,10 @@ Polymarket「香港最高气温」市场 Edge 计算器
 
 依赖：pip3 install requests（没有也能跑，会回落到 urllib）
 """
-import argparse, json, math, os, sys, time, datetime as dt
+import argparse, json, math, os, re, sys, time, datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "0.16.7"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
+VERSION = "0.16.8"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
 
 # Kelly 缩放：满 Kelly 波动太大、且概率本身有 ±5% 量级误差，实操一律打折。
 # 这里用 35% Kelly（原来是 1/4=25%）。
@@ -155,6 +155,9 @@ _CACHE_PATH = os.path.join(DATA, 'http_cache.json')
 OBS_LAT, OBS_LON = 22.302, 114.173
 TZ = dt.timezone(dt.timedelta(hours=8))
 MODELS = "ecmwf_ifs025,gfs_seamless,icon_seamless,gem_seamless,metno_seamless,jma_seamless,ukmo_seamless"
+
+# 上一句 load_observed_max() 实际采信了哪个源（仅供输出显示，v0.16.8）
+_OBS_MAX_SRC = None
 
 HKO_RHR   = "https://data.weather.gov.hk/weatherAPI/opendata/weather.php?dataType=rhrread&lang=en"
 HKO_FND   = "https://data.weather.gov.hk/weatherAPI/opendata/weather.php?dataType=fnd&lang=en"
@@ -453,6 +456,42 @@ def load_1min_max():
     return max(vals) if vals else None
 
 
+HKO_TEXT_READINGS = ('https://www.hko.gov.hk/textonly/v2/forecast/'
+                     'text_readings_e.htm')
+
+
+def fetch_official_max():
+    """官方 `text_readings_e.htm` 里 HK Observatory 行的 Max/Min Since Midnight。
+
+    v0.16.8 新增。**这是结算同源口径**：同一个天文台总部站、同一 0.1°C 精度，
+    而分区 CSV 只给「最新一笔」，它的 running max 是靠每 10 分钟轮询累积的 ——
+    漏采即低估，且滞后约 1 小时。
+
+    2026-09-14 14:30 实测：官方给 **28.7**，分区 CSV 的 running max 只有 **28.6**。
+    在 28.7 距 29.0 只差 0.3°C 的那天，这 0.1°C 直接改变「还差多少才越线」的分子。
+
+    返回 {'hko': 当前值, 'max': 当日最高, 'min': 当日最低, 'time': 'HH:MM'}；
+    页面结构或网络异常时返回 None（**必须静默失败**，不能打断主流程）。
+    """
+    try:
+        raw = _http_raw(HKO_TEXT_READINGS, 20)
+    except Exception:
+        return None
+    try:
+        txt = re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', raw))
+        # 行形态：HK Observatory  28.0  83  28.7 / 26.1  -3.3
+        #                                        ↑Max/↑Min
+        m = re.search(r'HK Observatory\s+([\d.]+)\s+(?:[\d.]+|N/A)\s+'
+                      r'([\d.]+)\s*/\s*([\d.]+)', txt)
+        if not m:
+            return None
+        tm = re.search(r'Latest readings recorded at (\d{1,2}:\d{2})', txt)
+        return {'hko': float(m.group(1)), 'max': float(m.group(2)),
+                'min': float(m.group(3)), 'time': tm.group(1) if tm else None}
+    except Exception:
+        return None
+
+
 def _cold_pool_path():
     return os.path.join(DATA, 'cold_pool_state.json')
 
@@ -525,9 +564,16 @@ def load_observed_max():
     日最高温具有单调性：已经观测到的值就是当日峰值的下限。
     日内复盘时必须以此为条件截断分布，否则会给出物理上不可能的低档概率。
 
-    优先取 0.1°C 分区气温源的 running max，再与 `--watch` 的整点日志取大者——
-    后者是整数位、每小时一次，只作为前者缺失时的兜底。
+    三个源取**最大者**（都偏低，取大者覆盖所有漏采方向）：
+    1. 官方 `text_readings_e.htm` 的 Max Since Midnight（v0.16.8 新增）——
+       结算同源、0.1°C、官方累计值，**最不可漏**；
+    2. 0.1°C 分区气温源的 running max（靠 10 分钟轮询累积，漏采即低估，滞后约 1h）；
+    3. `--watch` 的整点日志（整数位、每小时一次），仅作缺失时的兜底。
+
+    2026-09-14 14:30 实测：源 1 给 28.7，源 2 给 28.6 —— 在距 29.0 只差 0.3°C 的那天，
+    这 0.1°C 就是「还差多少才越线」的分子，不能少。
     """
+    global _OBS_MAX_SRC
     p = os.path.join(DATA, 'intraday_log.json')
     mx = None
     if os.path.exists(p):
@@ -540,8 +586,16 @@ def load_observed_max():
         except Exception:
             pass
     m1 = load_1min_max()
-    cands = [v for v in (mx, m1) if v is not None]
-    return max(cands) if cands else None
+    off = fetch_official_max()
+    m2 = off.get('max') if off else None
+    cands = [(v, nm) for v, nm in ((m2, '官方MaxSinceMidnight'),
+                                   (m1, '分区CSV-runningMax'),
+                                   (mx, '整点日志')) if v is not None]
+    if not cands:
+        _OBS_MAX_SRC = None
+        return None
+    _OBS_MAX_SRC = max(cands)[1]
+    return max(v for v, _ in cands)
 
 
 def watch_loop(interval_min=10, until='17:00'):
@@ -721,10 +775,17 @@ def watch():
     json.dump(log, open(log_p, 'w'))
 
     pts = [p for p in log['points'] if p['hko'] is not None]
-    # running max：0.1°C 源与整点日志取大者（前者精度高、采样密）
+    # running max：官方 Max Since Midnight + 0.1°C 分区源 + 整点日志，三个源取最大者
+    # （v0.16.8）三个源都只会**低估**当日最高：官方页是最不可漏的累计值，
+    # 另外两个靠轮询累积、漏采即低估。取大者正好覆盖所有漏采方向。
+    _off = fetch_official_max()
     _mx_cands = [v for v in (
-        max((p['hko'] for p in pts), default=None), load_1min_max()) if v is not None]
+        _off.get('max') if _off else None,
+        max((p['hko'] for p in pts), default=None),
+        load_1min_max()) if v is not None]
     mx = max(_mx_cands) if _mx_cands else None
+    if _off and mx is not None and abs(mx - _off['max']) < 0.05:
+        src_note = f"官方 Max Since Midnight {_off['max']:g}°C（{_off.get('time')}）+ {src_note}"
     sampled_h = {int(p['t'][11:13]) for p in pts}
     for pt in _load_1min_log().get('points', []):
         try:

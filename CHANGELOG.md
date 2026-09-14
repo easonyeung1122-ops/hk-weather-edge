@@ -11,7 +11,33 @@
 `SKILL.md` frontmatter 的 `version:`、`scripts/hk_edge.py` 的 `VERSION` 常量、
 以及**本文件下面的「当前版本」行**（最容易漏的一处）。
 
-当前版本：**v0.16.7**（`py -3 scripts/hk_edge.py --version` 可查）
+当前版本：**v0.16.8**（`py -3 scripts/hk_edge.py --version` 可查）
+
+---
+
+## v0.16.8 — 2026-09-14 · 官方 Max Since Midnight 写进脚本自动采集（PATCH）
+
+**只把 v0.16.7 的人工规则落到代码，核心概率算法零改动。**
+
+v0.16.7 把「当日最高以官方 `text_readings_e.htm` 的 Max Since Midnight 为准」写成了
+**人工规则**（SKILL.md A3b），但脚本没实现 —— 于是 `--watch` 仍然打分区 CSV 的 28.6，
+而官方是 28.7。规则写在文档、实现没跟上，等于没写。本次补齐。
+
+**改动**：
+- 新增 `fetch_official_max()`：解析 `text_readings_e.htm` 里 `HK Observatory` 行
+  （形态 `HK Observatory 28.0 83 28.7 / 26.1 -3.3` → 当前 28.0 / Max 28.7 / Min 26.1）。
+  **静默失败**：页面结构或网络异常一律返回 `None`，不打断主流程。
+  （顺带补上 `import re` —— 此前脚本未导入该模块。）
+- `load_observed_max()` 改**三源取大**：官方 Max Since Midnight + 0.1 °C 分区 CSV running max
+  + `--watch` 整点日志。三个源都只会**低估**当日最高，取大者覆盖所有漏采方向。
+  新增模块级 `_OBS_MAX_SRC` 记录实际采信的源（仅供输出显示）。
+- `--watch` 头部新增来源标注：
+  `实况源: 官方 Max Since Midnight 28.7°C（14:40）+ 分区气温CSV 0.1°C/10分钟`
+
+**实测**：改前 `--watch` 打「今日已观测最高 **28.6**」，改后打 **28.7** ✓
+
+⚠ 注意：官方页 URL 是 `https://www.hko.gov.hk/textonly/v2/forecast/text_readings_e.htm`
+（v0.16.7 文档里写的 `.../wxinfo/ts/text_readings_e.htm` 亦可达，本次统一为脚本实际使用的那个）。
 
 ---
 
