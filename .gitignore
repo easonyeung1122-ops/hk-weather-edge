@@ -9,6 +9,7 @@ scripts/data/http_cache.json
 scripts/data/summary.json
 scripts/data/hitrate.json
 scripts/data/sens_*.json
+scripts/data/cold_pool_state.json
 scripts/edge_report.html
 
 # 保留：scripts/data/diurnal_climatology.json（重算需数分钟，开箱即用）
