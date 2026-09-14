@@ -1,6 +1,6 @@
 ---
 name: hk-weather-edge
-version: 0.16.6
+version: 0.16.7
 description: Polymarket「香港最高气温」日度市场的 edge 计算与实况外推工具。把香港天文台(HKO)开放数据 + Open-Meteo 多模式 NWP 集合转为校准后的摄氏整数档(bucket)公允概率，并与市场价对比输出 EV 与 35% Kelly 仓位建议；`--watch` 模式基于结算站实测 + 日内气候曲线做当日峰值 nowcast。当用户提到「香港气温市场」「最高气温预测」「HKO / 天文台结算」「bucket 概率」「temperature bucket edge」「今天香港会到几度」「 polymarket weather Hong Kong」，或需要判断某个整数档是否值得买 YES / NO 时使用。
 ---
 
@@ -274,6 +274,35 @@ https://data.weather.gov.hk/weatherAPI/hko_data/regional-weather/latest_1min_tem
 
 **判断规则**：只要 `--date` 是当日、且实测值离整数边界 <0.5 °C，
 就必须以上述 CSV 为准，`rhrread` 只作交叉校验。
+
+### A3b. 「当日最高」以官方 `text_readings` 的 Max Since Midnight 为准（v0.16.7）
+
+⚠ **分区 CSV 的 running max 会比官方口径偏低 0.1 °C**（2026-09-14 实测）。
+
+分区 CSV 只给「最新一笔」，当日最高靠 10 分钟轮询累积 —— 这意味着：
+1. **漏采即低估**（哪怕只漏一个 10 分钟窗口）；
+2. CSV 有约 **1 小时滞后**，而官方页面是**结算同源**（HKO 总部站）。
+
+2026-09-14 14:30 实测对照：
+
+| 源 | 当日最高 |
+|---|---:|
+| 分区 CSV running max | 28.6 °C |
+| **官方 `text_readings_e.htm` Max Since Midnight** | **28.7 °C** |
+
+两者差 0.1 °C，而 28.7 距 29.0 只剩 **0.3 °C** —— 这 0.1 直接改变「还差多少才越线」的分子。
+
+**取法**（纯文本页面，无 API 鉴权）：
+
+```
+https://www.hko.gov.hk/wxinfo/ts/text_readings_e.htm
+```
+
+页面按 AWS 逐站给出「Maximum / Minimum Since Midnight」两列，结算站行名是
+**`HK Observatory`**；解析后取该行的第一个数字即 Max Since Midnight。
+
+**规则**：`--observed-max` **取「官方 Max Since Midnight」与「分区 CSV running max」的较大者**。
+官方值通常更准（结算同源），分区值作为「轮询确实看到了更高点」的兜底 —— 取大者两个错误方向都覆盖。
 
 ### B. 日内盯盘（`--watch`）
 
