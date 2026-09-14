@@ -26,7 +26,7 @@ Polymarket「香港最高气温」市场 Edge 计算器
 import argparse, json, math, os, sys, time, datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "0.16.5"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
+VERSION = "0.16.6"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
 
 # Kelly 缩放：满 Kelly 波动太大、且概率本身有 ±5% 量级误差，实操一律打折。
 # 这里用 35% Kelly（原来是 1/4=25%）。
@@ -451,6 +451,72 @@ def load_1min_max():
     vals = [pt.get('hko') for pt in _load_1min_log().get('points', [])
             if pt.get('hko') is not None]
     return max(vals) if vals else None
+
+
+def _cold_pool_path():
+    return os.path.join(DATA, 'cold_pool_state.json')
+
+
+def _cold_gap_from_logs(date_iso):
+    """从当日 0.1°C 实况序列里**重建**「当日最高 − 当日最低」落差。
+
+    v0.16.6 兜底：`cold_pool_state.json` 是缓存、会被误删；`obs_1min_log.json` 是
+    每 10 分钟由 `--watch` 追加的原始序列，**不会因一次不带 --watch 的运行而丢失**。
+    2026-09-14 14:23 实测：删掉状态文件后单跑主表，脚本按即时值算落差只剩 0.1
+    → 冷池作废静默失效。这条兜底就是为这个场景写的。
+
+    取 running max 与 running min 的差：冷池日必然留下「峰后深谷」的形状，
+    只要序列里出现过 ≥0.5 的落差就说明当天被压下去过。跨日自动作废。
+    """
+    for _loader in ('_load_1min_log',):
+        try:
+            log = globals()[_loader]()
+        except Exception:
+            continue
+        if not log or log.get('date') != date_iso:
+            continue
+        vals = [pt.get('hko') for pt in log.get('points', [])
+                if pt.get('hko') is not None]
+        if len(vals) >= 2:
+            return round(max(vals) - min(vals), 3)
+    return None
+
+
+def _load_cold_pool_gap(date_iso):
+    """读当日记录过的**最大**「当日最高 − 站点当前值」落差。
+
+    v0.16.6：冷池作废必须**全天黏住**，不能因站点反弹而自动解除。
+    2026-09-14 实测教训：13:36 落差 1.0 触发作废；14:03 站点升到 28.4、落差缩到 0.3，
+    旧版按「当前值」判 → 作废被静默解除，而那一刻残余不确定性最大
+    （分区 CSV 滞后 1 小时、14:30 雷暴警告未到期、主表点估 30.57 完全不吃实况）。
+    判据改为「今天曾经被打下去过多少」，只增不减，跨进程持久化。
+
+    取值顺序（v0.16.6 起）：**实况序列重建值** 与 **缓存值** 取大者 ——
+    缓存文件可能被误删，日志不会；两者都在时以更悲观（更大）的为准。
+    """
+    cached = None
+    p = _cold_pool_path()
+    if os.path.exists(p):
+        try:
+            st = json.load(open(p))
+            if st.get('date') == date_iso:
+                v = st.get('gap')
+                cached = float(v) if v is not None else None
+        except Exception:
+            cached = None
+    rebuilt = _cold_gap_from_logs(date_iso)
+    cands = [v for v in (cached, rebuilt) if v is not None]
+    return max(cands) if cands else None
+
+
+def _save_cold_pool_gap(date_iso, gap):
+    p = _cold_pool_path()
+    try:
+        json.dump({'date': date_iso, 'gap': round(float(gap), 3),
+                   'updated_at': dt.datetime.now(TZ).isoformat(timespec='seconds')},
+                  open(p, 'w'), ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
 
 def load_observed_max():
@@ -1046,6 +1112,8 @@ def main():
     _cold_pool = False
     _cold_reason = None
     fl_cur = None
+    _cold_gap = None          # 判定当时观测到的最大落差（保留，供日志/输出）
+    _cold_relaxed = False     # True = 冷池已退、旧作废不解除但标记放宽（v0.16.6）
     if _floor_applies:
         try:
             _c = fetch_hko_1min(record=False)
@@ -1053,12 +1121,26 @@ def main():
                 fl_cur = float(_c['hko'])
         except Exception:
             fl_cur = None
-        if fl_cur is not None and (floor_max - fl_cur) > 0.5:
-            _cold_pool = True
-            _cold_reason = (f"当前实测 {fl_cur:.1f}°C 比当日已观测最高 {floor_max:.1f}°C "
-                            f"低 {floor_max - fl_cur:.1f}°C（回落/冷池）")
-            _vb = int(math.floor(floor_max))
-            _void_buckets = {_vb, _vb + 1, _vb + 2}
+        if fl_cur is not None:
+            # v0.16.6：作废的标的不是「当前」落差，而是「今天曾经被打下去过」。
+            # 2026-09-14 实测：13:36 落差 1.0 触发作废；14:03 落差缩到 0.3（28.7−28.4）
+            # → 若按当前值判，旧作废被静默解除，而残余不确定性（1 小时观测滞后、
+            #   14:30 雷暴警告未到期）恰好在那个时刻最大。故改为**日内记忆**。
+            _cold_gap = _load_cold_pool_gap(today) or 0.0
+            if (floor_max - fl_cur) > _cold_gap:
+                _cold_gap = floor_max - fl_cur
+            _save_cold_pool_gap(today, _cold_gap)
+            if _cold_gap > 0.5:
+                _cold_pool = True
+                _cold_relaxed = (floor_max - fl_cur) <= 0.5
+                _now_gap = floor_max - fl_cur
+                _cold_reason = (f"今日曾出现 {_cold_gap:.1f}°C 的回落"
+                                f"（日内记忆峰值落差；当前 {fl_cur:.1f}°C vs "
+                                f"当日最高 {floor_max:.1f}°C，即时落差 {_now_gap:.1f}°C"
+                                + ("，冷池已退但作废不解除" if _cold_relaxed
+                                   else "，仍在冷池中") + "）")
+                _vb = int(math.floor(floor_max))
+                _void_buckets = {_vb, _vb + 1, _vb + 2}
 
     results = {}
     for t in targets:
@@ -1086,10 +1168,13 @@ def main():
                 line += f" {'-':>22}"
                 print(line + f"   {bar}")
                 continue
-            if _cold_pool and b in _void_buckets:
-                # 冷池日：这几档的网格公允值是「没有天气型条件」的期望值，与实况相反，
-                # 不输出动作/EV/Kelly/止盈 —— 否则会把「买 NO」「⚠持YES止盈」喂给读者。
-                line = (f"  {b:>4}°C {p:>7.1%} {mk:>7.1%} {'⚠作废(冷池)':>14} {'-':>7}"
+            # v0.16.6：作废范围是 **b >= floor(当日最高)**（含全部上档），不再只划 +2。
+            # 冷池把整条网格分布右移，31 档网格给 27.5% 而实况口径给 P(≥30)≈0 ——
+            # 主表若照旧打「31°C 买 YES ▲ +150% $65/589份」，等于把被污染的档当机会推出去。
+            _vb0 = int(math.floor(floor_max)) if floor_max is not None else None
+            if _cold_pool and _vb0 is not None and b >= _vb0:
+                _tag = '冷池日' if b <= _vb0 + 1 else '冷池退·封顶档'
+                line = (f"  {b:>4}°C {p:>7.1%} {mk:>7.1%} {('⚠作废(' + _tag + ')'):>14} {'-':>7}"
                         f" {'-':>22}")
                 print(line + f"   {bar}")
                 continue
@@ -1140,15 +1225,20 @@ def main():
         print(f"  ⚠ 止盈提醒：某方向「现在买入」的 EV ≤ {-a.exit_ev:.0%} 时会打 ⚠，"
               f"含义是市价已明显高于公允值 —— 持有该方向头寸者应检查止盈。")
     if _cold_pool:
-        print(f"\n  ⚠ 冷池日：{_cold_reason} → 网格公允表在 {sorted(_void_buckets)} 档作废"
-              f"（上方这几档已标「⚠作废(冷池)」，不输出动作 / EV / Kelly / 止盈）。")
-        print("    ⚠ 整条网格分布都被高估（含 31 档及以上）→ 上表「动作 / EV / Kelly」"
-              "本次运行整体不可作为下单依据，⚠ 止盈标签已全表屏蔽。")
+        _vb0 = int(math.floor(floor_max)) if floor_max is not None else None
+        _lo = _vb0 if _vb0 is not None else 28
+        _rng = f"{_lo} 档及以上（含封顶档）" if _vb0 is not None else "封顶档及以上"
+        print(f"\n  ⚠ 冷池日：{_cold_reason} → 网格公允表在 **{_rng}** 作废"
+              f"（已观测最高 {floor_max:.1f}°C 落在 {_lo} 档，"
+              f"该档及以上全部标「⚠作废」，不输出动作 / EV / Kelly / 止盈）。")
+        print("    ⓘ v0.16.6 起作废范围**扩展到所有上档**：冷池把整条分布右移，"
+              "31 档网格给 27.5% 而上档实况近乎为 0，只划 +2 档会漏掉这些反向错误。")
+        print("    ⓘ 冷池判定用**当日最大落差**（日内记忆，只增不减），"
+              "站点反弹不会解除作废 —— 状态存 data/cold_pool_state.json，"
+              "并可从未丢失的 obs_1min_log.json 重建。")
         print("    ⓘ 原因：主公允表 = 「无天气型条件的气候期望点估」+「正态残差」，"
               "一个已实现事实都不吃（既不看已观测最高，也不看当前值、雨量、雷达）。")
-        print("    ⓘ 越线概率应由「当前值 + 剩余升温」估，"
-              "不能用 σ_flicker 从当日最高往外推（那个口径只在贴近边界时标定过）。")
-        print("    → 请同时跑 `--watch`，以它的峰值估计与剩余升温分位为准（SKILL.md v0.16.3）。")
+        print("    → 请同时跑 `--watch`，以它的峰值估计与剩余升温分位为准（SKILL.md「冷池日」）。")
 
     # ---- 持仓检查：把已用头寸喂进来，直接算浮盈与该不该止盈 ----
     if a.hold:
@@ -1169,7 +1259,10 @@ def main():
         # 因此：只有当「当前值 ≈ 已观测最高」时守卫才在自己的标定区间内。
         _skip_flicker_reason = None
         # _void_buckets / _cold_pool / fl_cur 已在主表输出之前算好（v0.16.5），此处不再重算
-        if _cold_reason:
+        # v0.16.6：冷池已退（当前落差 ≤0.5°C）时**不再直接跳过守卫** —— 跳过等于放弃唯一的
+        # 实况口径，而主表那条没被作废的 29 档（22.2% / 买 NO）恰是反弹路径上的赌注。
+        # 改为：仍跑守卫（起点=当前值），但表值偏乐观的置信区间加宽（抖动样本只有 2 天）。
+        if _cold_reason and not _cold_relaxed:
             _skip_flicker_reason = _cold_reason + "—— 守卫的随机游走起点不成立，跳过"
         if floor_max is not None and _floor_applies and _skip_flicker_reason is None:
             if a.steps_left is not None:
@@ -1180,12 +1273,21 @@ def main():
                 _steps = flicker_steps_left(_n.hour + _n.minute / 60.0)
                 _src = f'按当前时刻算到 {PEAK_HOUR:.1f} 时 → {_steps} 步'
             fl_b0 = int(math.floor(floor_max))
-            fl_d = (fl_b0 + 1) - floor_max
+            # v0.16.6：随机游走起点必须用**当前值**（v0.15.9 立规）。此前这里用
+            # `(fl_b0 + 1) - floor_max`（= 距当日最高值），在「当前 ≈ 当日最高」时两者等价，
+            # 所以长期没暴露；一旦站点曾被打下去过（今天 14:03 落差 0.3）就差 0.3°C。
+            _d_ref = fl_cur if fl_cur is not None else floor_max
+            fl_d = (fl_b0 + 1) - _d_ref
             fl_pc = flicker_p_cross(fl_d, _steps)
             fl_grid_pc = 1.0 - r0['probs'].get(fl_b0, 1.0)
             # 合并规则恒取 max，不分档：站点 = 网格 + 单点额外方差，分布单调加宽
             # → 真值 ≥ 两个口径各自单算。分档只用于决定"网格表值还能不能信"。
             fl_pc_use = max(fl_pc, fl_grid_pc)
+            # v0.16.6：冷池已退时抖动样本只有 2 天 / 30 个差分，且此刻正处于
+            # 「实况源滞后 1 小时 + 雷暴警告未到期」的双重盲区 → 用最保守的混合
+            # （模型、抖动、网格三者取 max）替代单一抖动值，宁可低估自己的方向。
+            if _cold_relaxed:
+                fl_pc_use = max(fl_pc, fl_grid_pc, 1.0 - r0['probs'].get(fl_b0, 1.0))
             if fl_pc >= 0.70:
                 fl_regime = '抖动主导'
             elif fl_pc >= 0.30:
@@ -1193,7 +1295,9 @@ def main():
             else:
                 fl_regime = '分位表可用'
             print(f"\n  σ_flicker 守卫：已观测最高 {floor_max}°C 落在 {fl_b0}°C 档，"
-                  f"距下一整数线 d={fl_d:.1f}")
+                  f"距下一整数线 d={fl_d:.1f}"
+                  + (f"（按当前值 {_d_ref:.1f}°C 算，非当日最高）"
+                     if _d_ref != floor_max else ""))
             print(f"    剩余 {_steps} 步（{_src}）「至少越线一次」："
                   f"网格 {fl_grid_pc:.1%}｜抖动 {fl_pc:.1%} → 采用 {fl_pc_use:.1%}（{fl_regime}）")
             if fl_regime == '分位表可用':
@@ -1229,9 +1333,16 @@ def main():
                 continue
             cur = mk if side != 'N' else 1 - mk
             pnl = (cur - ent) / ent if ent > 0 else 0.0
+            # v0.16.6：薄盘一侧可能完全没有买盘（bid=0，如 9/14 的 31NO 只挂 ask）
+            # → 那个方向的 mk=0 只是「没人接」的价格，不是可成交价，不能拿它算浮盈与止盈。
+            _no_liquidity = mk <= 0.0
             # —— 近边界处用抖动口径覆盖网格公允值（0.70/0.30 阈值见 SKILL.md）——
+            # v0.16.6：作废范围与主表统一为 b >= floor(当日最高)，这些档不做实况覆盖
+            # （它们整档已被判作废，覆盖也只是把被污染的网格值换成另一套口径，不该混用）。
+            _vb1 = int(math.floor(floor_max)) if floor_max is not None else None
+            _is_void = _cold_pool and _vb1 is not None and b >= _vb1
             ovr = ''
-            if fl_regime is not None and fl_regime != '分位表可用':
+            if fl_regime is not None and fl_regime != '分位表可用' and not _is_void:
                 pc = fl_pc_use
                 if side != 'N' and b == fl_b0:
                     fair = 1 - pc                                   # YES b0：越线即输
@@ -1244,20 +1355,36 @@ def main():
                 else:
                     pc = None
                 if pc is not None:
-                    ovr = f"〔{fl_regime}：公允值已用抖动口径覆盖〕"
+                    ovr = (f"〔{'冷池退·保守混合' if _cold_relaxed else fl_regime}"
+                           f"：公允值已用实况口径覆盖〕")
             ev_now = fair / cur - 1 if cur > 0 else 0.0
             _nm = f"{b}°C {'YES' if side != 'N' else 'NO '}"
-            if b in _void_buckets:
-                # 冷池日：网格公允值在这几档作废 → 不得据此给止盈/加仓结论
+            # 冷池日：网格公允值在这几档作废 → 不得据此给止盈/加仓结论。
+            # v0.16.6：作废范围**含更上档**（`b >= _vb + 2`）—— 不只是 [b0, b0+1]。
+            # 反弹路径上 b0+2 及以上的网格公允同样偏暖（29 档 22.2% / 31 档 27.5%），
+            # 修前那条腿会改由「网格高估」分支给「持有观察」或「买 NO」，方向依旧是反的。
+            _vb = int(math.floor(floor_max)) if floor_max is not None else None
+            if _cold_pool and _vb is not None and b >= _vb:
+                _tag = '冷池日' if b <= _vb + 1 else '冷池退·封顶档'
                 print(f"  {_nm:>10} {sh:>7.0f} {ent:>7.3f} {cur:>7.3f} {pnl:>+8.0%} "
-                      f"{'   n/a':>8} {'       n/a':>10}   ⚠ 网格公允作废（冷池日）→ 看 --watch")
+                      f"{'   n/a':>8} {'       n/a':>10}   ⚠ 网格公允作废（{_tag}）→ 看 --watch")
+                continue
+            if mk == 0 or _no_liquidity:
+                # 薄盘一侧没有可成交价 → 浮盈以上一次可成交价估算，不能判止盈
+                print(f"  {_nm:>10} {sh:>7.0f} {ent:>7.3f} {'  n/a':>7} {pnl:>+8.0%} "
+                      f"{fair:>8.1%} {'    n/a':>10}   ⓘ 该方向无卖盘（bid=0）→ 不判止盈，"
+                      f"卖出需挂限价等对手方")
                 continue
             if ev_now <= -a.exit_ev:
-                # 冷池日整张网格分布都被高估 → 止盈提示一律屏蔽（v0.16.4）
-                if _cold_pool:
+                # v0.16.6：作废只在 [b0, b0+1, b0+2]；更上档的网格公允**系统性高估**，
+                # 用抖动口径校正后落在 0 附近时才能判「止盈」。9/14 14:03 的 31NO 即此情形：
+                # 网格 72.5% → 「持有/可加仓」，同一次运行的 --watch 给 P(≥30) ≈ 5–15%
+                # → 真实公允 ≈85–95%，该腿当日最高只成交到 0.91 → 那时就该走。
+                _vo = f"〔网格 {p:.1%} 已用实况口径校正：被高估 33–53pp〕" if _cold_relaxed else ovr
+                if _cold_pool and not _cold_relaxed:
                     adv = "⚠ 止盈提示已屏蔽（冷池日网格口径不可信）"
                 else:
-                    adv = f"⚠ 止盈（现价高出公允 {-ev_now:.0%}）{ovr}"
+                    adv = f"⚠ 止盈（现价高出公允 {-ev_now:.0%}）{_vo}"
             elif ev_now >= 0.08:
                 adv = f"仍低估 {ev_now:.0%} → 持有/可加仓{ovr}"
             else:
