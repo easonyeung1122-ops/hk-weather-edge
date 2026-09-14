@@ -26,7 +26,7 @@ Polymarket「香港最高气温」市场 Edge 计算器
 import argparse, json, math, os, sys, time, datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "0.15.8"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
+VERSION = "0.16.0"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
 
 # Kelly 缩放：满 Kelly 波动太大、且概率本身有 ±5% 量级误差，实操一律打折。
 # 这里用 35% Kelly（原来是 1/4=25%）。
@@ -1119,7 +1119,27 @@ def main():
         # 现价 0.93 → 判「持有观察」，两小时后归零。真实越线概率当时 ≈75%。
         fl_b0 = fl_d = fl_pc = fl_grid_pc = fl_pc_use = None
         fl_regime = None
+        # v0.15.9 修正：随机游走的**起点必须是当前实测值，不是当日已观测最高**。
+        # 9/12 标定时两者几乎相等（站点全天贴着边界），所以旧写法看不出问题；
+        # 但 2026-09-14 出现了站点被雷暴外流压到低于当日最高 1.6°C 的情形，
+        # 旧写法把 d 算成 0.3（应由当前值算成 1.9）→ 越线概率报 99.5% 而实际约 30% 量级，
+        # 直接把 28YES 误判成「止盈」、把 28 档 YES 公允压到 0.5%。
+        # 因此：只有当「当前值 ≈ 已观测最高」时守卫才在自己的标定区间内。
+        _skip_flicker_reason = None
+        fl_cur = None
+        if a.hold:
+            try:
+                _c = fetch_hko_1min(record=False)
+                if _c and _c.get('hko') is not None:
+                    fl_cur = float(_c['hko'])
+            except Exception:
+                fl_cur = None
         if floor_max is not None and _floor_applies:
+            if fl_cur is not None and (floor_max - fl_cur) > 0.5:
+                _skip_flicker_reason = (
+                    f"当前实测 {fl_cur:.1f}°C 比当日已观测最高 {floor_max:.1f}°C 低 "
+                    f"{floor_max - fl_cur:.1f}°C（回落/冷池）—— 守卫的随机游走起点不成立，跳过")
+        if floor_max is not None and _floor_applies and _skip_flicker_reason is None:
             if a.steps_left is not None:
                 _steps = max(1, a.steps_left)
                 _src = f'--steps-left {_steps}'
@@ -1152,6 +1172,11 @@ def main():
                 print("    ⚠ σ_flicker 只有 2 天 / 30 个差分样本 → 表值是上界，只作开关。")
                 print("    ⓘ 上方「公允P」列仍是网格口径（未覆盖）——保守方向：新开仓的 edge "
                       "会被低估，不会被高估。")
+        if _skip_flicker_reason:
+            print("\n  σ_flicker 守卫已跳过：" + _skip_flicker_reason)
+            print("    → 边界那一对档位本轮不做抖动覆盖，持仓检查按网格公允值读；")
+            print("      回落幅度 >0.5°C 时，越线概率应由「当前值 + 剩余升温」估，")
+            print("      不能用 σ_flicker 从当日最高往外推（那个口径只在贴近边界时标定过）。")
         print(f"\n■ 持仓检查 {t0}（止盈阈值：现在买入 EV ≤ {-a.exit_ev:.0%}）")
         print(f"  {'头寸':>10} {'份数':>7} {'成本':>7} {'现价':>7} {'浮盈':>8} {'公允':>8} "
               f"{'现在买入EV':>10}   建议")
