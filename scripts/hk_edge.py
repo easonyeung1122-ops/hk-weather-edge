@@ -26,7 +26,7 @@ Polymarket「香港最高气温」市场 Edge 计算器
 import argparse, json, math, os, sys, time, datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "0.16.4"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
+VERSION = "0.16.5"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
 
 # Kelly 缩放：满 Kelly 波动太大、且概率本身有 ±5% 量级误差，实操一律打折。
 # 这里用 35% Kelly（原来是 1/4=25%）。
@@ -1037,6 +1037,29 @@ def main():
         print(f"本金未指定 → 默认按 {bankroll:.0f} USDC 估算 {KELLY_FRAC:.0%} Kelly "
               f"下注额（用 --bankroll 覆盖）")
 
+    # ---- 冷池日判定（v0.16.5：提前到主表输出之前）----
+    # 主公允表 = 「无天气型条件的气候期望点估」+「正态残差」，一个已实现事实都不吃。
+    # 当天出现过 ≥0.5°C 的回落（对流冷池 / 锋面）时，整张网格分布被高估 ——
+    # 此时主表的公允 P、EV、Kelly 与 ⚠ 止盈标签全部不可读，必须在**主表那一行**就标出来，
+    # 不能只写在后面持仓检查的小字里（v0.16.4 的遗留缺口：主表照打 ⚠持YES止盈-84%）。
+    _void_buckets = set()
+    _cold_pool = False
+    _cold_reason = None
+    fl_cur = None
+    if _floor_applies:
+        try:
+            _c = fetch_hko_1min(record=False)
+            if _c and _c.get('hko') is not None:
+                fl_cur = float(_c['hko'])
+        except Exception:
+            fl_cur = None
+        if fl_cur is not None and (floor_max - fl_cur) > 0.5:
+            _cold_pool = True
+            _cold_reason = (f"当前实测 {fl_cur:.1f}°C 比当日已观测最高 {floor_max:.1f}°C "
+                            f"低 {floor_max - fl_cur:.1f}°C（回落/冷池）")
+            _vb = int(math.floor(floor_max))
+            _void_buckets = {_vb, _vb + 1, _vb + 2}
+
     results = {}
     for t in targets:
         r = bucket_probs(t, det, ens, calib, mu_override=a.mu,
@@ -1061,6 +1084,13 @@ def main():
             if mk is None:
                 line = f"  {b:>4}°C {p:>7.1%} {'-':>8} {'-':>14} {'-':>7}"
                 line += f" {'-':>22}"
+                print(line + f"   {bar}")
+                continue
+            if _cold_pool and b in _void_buckets:
+                # 冷池日：这几档的网格公允值是「没有天气型条件」的期望值，与实况相反，
+                # 不输出动作/EV/Kelly/止盈 —— 否则会把「买 NO」「⚠持YES止盈」喂给读者。
+                line = (f"  {b:>4}°C {p:>7.1%} {mk:>7.1%} {'⚠作废(冷池)':>14} {'-':>7}"
+                        f" {'-':>22}")
                 print(line + f"   {bar}")
                 continue
             ev_buy = p / mk - 1
@@ -1092,10 +1122,12 @@ def main():
             # 反向 edge = 止盈信号：这个方向的 EV 很负，说明市价已明显高于公允值，
             # 还拿着这个方向头寸的人应该考虑平仓，而不是继续持有到期。
             warns = []
-            if ev_buy <= -a.exit_ev:
-                warns.append(f"⚠持YES止盈{ev_buy:.0%}")
-            if ev_sell <= -a.exit_ev:
-                warns.append(f"⚠持NO止盈{ev_sell:.0%}")
+            # 冷池日整条网格分布被高估 → ⚠ 止盈标签一律屏蔽（全表生效，不只在作废档）
+            if not _cold_pool:
+                if ev_buy <= -a.exit_ev:
+                    warns.append(f"⚠持YES止盈{ev_buy:.0%}")
+                if ev_sell <= -a.exit_ev:
+                    warns.append(f"⚠持NO止盈{ev_sell:.0%}")
             if warns:
                 line += "  " + " ".join(warns)
             print(line + f"   {bar}")
@@ -1107,6 +1139,16 @@ def main():
               "下单前按订单簿可执行价重算一次（见 A0）——单价差 1 分钱，份数会差不少。")
         print(f"  ⚠ 止盈提醒：某方向「现在买入」的 EV ≤ {-a.exit_ev:.0%} 时会打 ⚠，"
               f"含义是市价已明显高于公允值 —— 持有该方向头寸者应检查止盈。")
+    if _cold_pool:
+        print(f"\n  ⚠ 冷池日：{_cold_reason} → 网格公允表在 {sorted(_void_buckets)} 档作废"
+              f"（上方这几档已标「⚠作废(冷池)」，不输出动作 / EV / Kelly / 止盈）。")
+        print("    ⚠ 整条网格分布都被高估（含 31 档及以上）→ 上表「动作 / EV / Kelly」"
+              "本次运行整体不可作为下单依据，⚠ 止盈标签已全表屏蔽。")
+        print("    ⓘ 原因：主公允表 = 「无天气型条件的气候期望点估」+「正态残差」，"
+              "一个已实现事实都不吃（既不看已观测最高，也不看当前值、雨量、雷达）。")
+        print("    ⓘ 越线概率应由「当前值 + 剩余升温」估，"
+              "不能用 σ_flicker 从当日最高往外推（那个口径只在贴近边界时标定过）。")
+        print("    → 请同时跑 `--watch`，以它的峰值估计与剩余升温分位为准（SKILL.md v0.16.3）。")
 
     # ---- 持仓检查：把已用头寸喂进来，直接算浮盈与该不该止盈 ----
     if a.hold:
@@ -1126,21 +1168,9 @@ def main():
         # 直接把 28YES 误判成「止盈」、把 28 档 YES 公允压到 0.5%。
         # 因此：只有当「当前值 ≈ 已观测最高」时守卫才在自己的标定区间内。
         _skip_flicker_reason = None
-        _void_buckets = set()      # 冷池日：网格公允表不可用的档位（v0.16.4）
-        _cold_pool = False
-        fl_cur = None
-        if a.hold:
-            try:
-                _c = fetch_hko_1min(record=False)
-                if _c and _c.get('hko') is not None:
-                    fl_cur = float(_c['hko'])
-            except Exception:
-                fl_cur = None
-        if floor_max is not None and _floor_applies:
-            if fl_cur is not None and (floor_max - fl_cur) > 0.5:
-                _skip_flicker_reason = (
-                    f"当前实测 {fl_cur:.1f}°C 比当日已观测最高 {floor_max:.1f}°C 低 "
-                    f"{floor_max - fl_cur:.1f}°C（回落/冷池）—— 守卫的随机游走起点不成立，跳过")
+        # _void_buckets / _cold_pool / fl_cur 已在主表输出之前算好（v0.16.5），此处不再重算
+        if _cold_reason:
+            _skip_flicker_reason = _cold_reason + "—— 守卫的随机游走起点不成立，跳过"
         if floor_max is not None and _floor_applies and _skip_flicker_reason is None:
             if a.steps_left is not None:
                 _steps = max(1, a.steps_left)
@@ -1175,18 +1205,7 @@ def main():
                 print("    ⓘ 上方「公允P」列仍是网格口径（未覆盖）——保守方向：新开仓的 edge "
                       "会被低估，不会被高估。")
         if _skip_flicker_reason:
-            _cold_pool = True
-            _vb = int(math.floor(floor_max)) if floor_max is not None else None
-            if _vb is not None:
-                _void_buckets = {_vb, _vb + 1, _vb + 2}
             print("\n  σ_flicker 守卫已跳过：" + _skip_flicker_reason)
-            print(f"    ⚠ 冷池日：实测已回落到当日最高之下 → 网格公允表在 "
-                  f"{sorted(_void_buckets)} 档不可用（上方「公允P」列这几档不要读）。")
-            print("      ⓘ 原因：主公允表 = 「无天气型条件的气候期望点估」+「正态残差」，"
-                  "一个已实现事实都不吃。")
-            print("      ⓘ 越线概率应由「当前值 + 剩余升温」估，"
-                  "不能用 σ_flicker 从当日最高往外推（那个口径只在贴近边界时标定过）。")
-            print("      → 请同时跑 `--watch`，以它的峰值估计与剩余升温分位为准（SKILL.md v0.16.3）。")
         print(f"\n■ 持仓检查 {t0}（止盈阈值：现在买入 EV ≤ {-a.exit_ev:.0%}）")
         print(f"  {'头寸':>10} {'份数':>7} {'成本':>7} {'现价':>7} {'浮盈':>8} {'公允':>8} "
               f"{'现在买入EV':>10}   建议")
