@@ -26,7 +26,7 @@ Polymarket「香港最高气温」市场 Edge 计算器
 import argparse, json, math, os, re, sys, time, datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "0.16.8"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
+VERSION = "0.16.9"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
 
 # Kelly 缩放：满 Kelly 波动太大、且概率本身有 ±5% 量级误差，实操一律打折。
 # 这里用 35% Kelly（原来是 1/4=25%）。
@@ -934,7 +934,19 @@ def watch():
                         probs_out[b] = 1.0
                         print(f"        到 {b}.0°C  已实测达成  → 概率约 100%")
                         continue
-                    need = b - (intraday_mx if intraday_mx is not None else hko_t)
+                    # ——— need 的基准口径（v0.16.9）———
+                    # 分位表 R 的原生定义是「日终 max − **当小时实测值**」，基准是当前值，
+                    # 不是已实现峰值。用峰值作基准会隐含「已回落的部分会自动涨回去」，
+                    # 系统性低估 need、高估越线概率。
+                    # 2026-09-14 15:30 实测：站点 27.8、已实现峰值 28.7、目标 29.0 ——
+                    #   严格口径 need = 29.0 − 27.8 = 1.2 → h=15 网格 0%（335 样本最大 R 仅 0.6）
+                    #   宽松口径 need = 29.0 − 28.7 = 0.3 → 网格 1.0%
+                    # 两者相差数倍到数十倍，**分歧本身就是信息**：给单一数字等于藏起口径风险。
+                    # 主输出用严格口径（数学正确）；并列打印宽松口径作为「hko_t 可能陈旧」的对照。
+                    _base_cur = hko_t if hko_t is not None else intraday_mx
+                    _base_mx = intraday_mx if intraday_mx is not None else hko_t
+                    need = b - _base_cur
+                    need_mx = b - _base_mx if _base_mx is not None else need
                     if tbl is not None and intraday_mx is not None:
                         # δ 当随机量（1σ = DELTA_REL_SIGMA×|δ|），消除 δ>need 的 99% 饱和
                         prob = cdf_upper_delta(tbl, need - delta,
@@ -945,7 +957,16 @@ def watch():
                         prob = (1 - norm_cdf((need - rm_) / d['sd'])) if d['sd'] > 0 \
                             else (1.0 if need <= rm_ else 0.0)
                     probs_out[b] = prob
-                    print(f"        到 {b}.0°C  需再升 {need:+.1f}°C  → 概率约 {prob:.0%}")
+                    if abs(need_mx - need) > 0.05:
+                        prob_mx = cdf_upper_delta(tbl, need_mx - delta,
+                                                  DELTA_REL_SIGMA * abs(delta)) \
+                            if (tbl is not None and intraday_mx is not None) else prob
+                        print(f"        到 {b}.0°C  需再升 {need:+.1f}°C（基准=当前 "
+                              f"{_base_cur:.1f}）→ 概率约 {prob:.0%}"
+                              f"   ⓘ 若以峰值 {_base_mx:.1f} 起算：{need_mx:+.1f}°C → "
+                              f"{prob_mx:.0%}（站点已回落，后者隐含「回到峰位」，非原生口径）")
+                    else:
+                        print(f"        到 {b}.0°C  需再升 {need:+.1f}°C  → 概率约 {prob:.0%}")
                 _log_forecast(today, rt, hh, intraday_mx, pred, probs_out)
                 print("     ⚠️ 阴雨/雷暴日会显著低于此估计；若午后雨已到，以上即为上限")
     except Exception as e:

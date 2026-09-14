@@ -1,6 +1,6 @@
 ---
 name: hk-weather-edge
-version: 0.16.8
+version: 0.16.9
 description: Polymarket「香港最高气温」日度市场的 edge 计算与实况外推工具。把香港天文台(HKO)开放数据 + Open-Meteo 多模式 NWP 集合转为校准后的摄氏整数档(bucket)公允概率，并与市场价对比输出 EV 与 35% Kelly 仓位建议；`--watch` 模式基于结算站实测 + 日内气候曲线做当日峰值 nowcast。当用户提到「香港气温市场」「最高气温预测」「HKO / 天文台结算」「bucket 概率」「temperature bucket edge」「今天香港会到几度」「 polymarket weather Hong Kong」，或需要判断某个整数档是否值得买 YES / NO 时使用。
 ---
 
@@ -315,6 +315,41 @@ HK Observatory   28.0   83   28.7 / 26.1   -3.3
 - `--watch` 会标注实际采信的源：`实况源: 官方 Max Since Midnight 28.7°C（14:40）+ 分区气温CSV ...`
 
 **规则**：`--observed-max` **取三源较大者**。人工复核时以官方值为准。
+
+### A3c. 分位表的基准是「当小时实测值」，不是「已实现峰值」（v0.16.9 定规）
+
+**这是全套工具里最容易搞错、代价最大的一条口径。**
+
+分位表的定义是 one-touch 剩余升温：
+
+```
+R = 日终 max − 当小时实测值        ← 基准是「此刻的站点温度」
+```
+
+所以问「日终 max ≥ 29.0」时，**必须从当前值起算**：
+
+| 时点 | 当前值 | 已实现峰值 | 严格 need（当前值起算） | 宽松 need（峰值起算） |
+|---|---:|---:|---:|---:|
+| 2026-09-14 14:51 | 28.0 | 28.7 | **+1.0** → h=14 网格 **0.3%** | +0.3 → 7.0% |
+| 2026-09-14 15:30 | 27.8 | 28.7 | **+1.2** → h=15 网格 **0%** | +0.3 → 1.0% |
+
+**两者相差 3–23 倍**。用峰值起算，等于隐含假设「已经回落的部分会自动涨回去」——
+这在站点已过峰时是**系统性高估越线概率**。
+
+⚠ **v0.16.8 及以前，`--watch` 用的正是错误口径**：`need = b − intraday_mx`
+（`intraday_mx` = 当日已观测最高）。2026-09-14 15:30 它打的是
+「到 29.0°C 需再升 **+0.3**°C → 概率约 **5%**」，而严格口径是「需再升 **+1.2**°C → **0%**」。
+**v0.16.9 起主输出改用严格口径，并并列打印宽松口径** —— 两个口径的分歧本身就是信息，
+给单一数字等于把口径风险藏起来。
+
+**为什么两个口径都要打印**（不是多余的）：
+
+- 严格口径在「站点**确实已回落**」时是唯一正确的；
+- 宽松口径在「`hko_t` **陈旧**（分区 CSV 滞后约 1h）、站点实际更高」时更接近真值，
+  可作为敏感性上界。
+
+**判读纪律**：拿到 `--watch` 的越线概率，先看它标的是哪个基准。
+若只看到「需再升 +0.3」而站点已从峰值回落 0.9，**先自己重算 29.0 − 当前值**。
 
 ### B. 日内盯盘（`--watch`）
 
@@ -1486,7 +1521,10 @@ py -3 scripts/rec_pnl.py --markdown                        # 重新生成仓库�
 
 **(1) 权威实时口径：HK Observatory「Maximum Air Temperature Since Midnight」**
 
-`https://www.hko.gov.hk/wxinfo/ts/text_readings_e.htm` 的 `<pre>` 块按 AWS 逐站给出
+`https://www.hko.gov.hk/textonly/v2/forecast/text_readings_e.htm` 的 `<pre>` 块按 AWS 逐站给出
+（⚠ 同一页的另一个镜像 `wxinfo/ts/text_readings_e.htm` 也返回 200，但版式不同 —— 脚本固定抓
+`textonly/v2/forecast/`，**站名写作简写 `HK Observatory`，不是 `Hong Kong Observatory`**，
+写全称的正则会匹配不到）
 
 ```
 Air Temperature | Relative Humidity | Maximum/Minimum Air Temperature Since Midnight | Past 24-hour Temperature Difference
