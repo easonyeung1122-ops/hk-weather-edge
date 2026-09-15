@@ -41,6 +41,17 @@ RESID_SD_DEFAULT = 0.76
 SD_L_DEFAULT = 0.60          # L 自身的 1σ（2026-09-15 09h/10h 两个整点样本实测摆动）
 MKT_WEIGHT = 0.25            # 市场收缩权重
 
+# ⚠ 口径必须统一（2026-09-15 11:20 发现并修复）：
+# `model_calib.json` 的 bias/resid_sd 是拿**7 个 NWP 模式的平均日最高**校准的，
+# 而 `hk_edge.OM_HR` 用的是 Open-Meteo 的 `best_match`（加权混合，今天就比 7 模式
+# 平均高出 +0.79°C）。把 best_match 的 g_rest 配上 7 模式平均的 bias 做收缩，
+# 会**系统性高估峰值 0.79°C** —— 正好横跨 30/31 档分界线。
+# 因此默认改用同一批模式的平均值作网格基线。
+OM_HR_MULTI = ("https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
+               "&hourly=temperature_2m&forecast_days=1&past_hours={ph}"
+               "&timezone=Asia%2FShanghai&models=" + H.MODELS)
+GRID_SRC_DEFAULT = 'multimodel'
+
 
 def norm_pdf(x, mu, s):
     return math.exp(-0.5 * ((x - mu) / s) ** 2) / (s * math.sqrt(2 * math.pi))
@@ -50,7 +61,30 @@ def norm_cdf(x, mu, s):
     return 0.5 * (1 + math.erf((x - mu) / (s * math.sqrt(2))))
 
 
-def load_context(observed_max, current, hour, date_iso=None):
+def grid_series(hour, date_iso, grid_src):
+    """返回 {hour: 网格温度}。grid_src='multimodel' 时用 7 模式平均（与 bias 同口径）。"""
+    ph = max(3, hour + 1)
+    if grid_src == 'best_match':
+        oh = H._get(H.OM_HR.format(lat=H.OBS_LAT, lon=H.OBS_LON, ph=ph), 30)
+        hr = oh['hourly']
+        cols = ['temperature_2m']
+    else:
+        oh = H._get(OM_HR_MULTI.format(lat=H.OBS_LAT, lon=H.OBS_LON, ph=ph), 30)
+        hr = oh['hourly']
+        cols = [k for k in hr if k.startswith('temperature_2m_')
+                or k == 'temperature_2m']
+    grid = {}
+    for i, t in enumerate(hr['time']):
+        if not t.startswith(date_iso):
+            continue
+        vals = [hr[c][i] for c in cols
+                if hr.get(c) and i < len(hr[c]) and hr[c][i] is not None]
+        if vals:
+            grid[int(t[11:13])] = sum(float(v) for v in vals) / len(vals)
+    return grid
+
+
+def load_context(observed_max, current, hour, date_iso=None, grid_src=GRID_SRC_DEFAULT):
     """装配 one-touch 所需的全部输入（与 hk_edge.watch() 同口径）。"""
     import datetime as dt
     date_iso = date_iso or dt.datetime.now(H.TZ).date().isoformat()
@@ -58,12 +92,7 @@ def load_context(observed_max, current, hour, date_iso=None):
     rcdf = json.load(open(os.path.join(DATA, 'remaining_rise_cdf.json')))
     tbl = (rcdf.get('by_month', {}).get(str(int(date_iso[5:7])), {}).get(str(hour))
            or rcdf.get('by_hour', {}).get(str(hour)))
-    oh = H._get(H.OM_HR.format(lat=H.OBS_LAT, lon=H.OBS_LON, ph=max(3, hour + 1)), 30)
-    grid = {}
-    for t, v in zip(oh['hourly']['time'], oh['hourly']['temperature_2m']):
-        if not t.startswith(date_iso) or v is None:
-            continue
-        grid[int(t[11:13])] = float(v)
+    grid = grid_series(hour, date_iso, grid_src)
     g_rest = max((v for h, v in grid.items() if h >= hour), default=None)
     return calib, tbl, grid, g_rest
 
@@ -184,13 +213,17 @@ def main():
     ap.add_argument('--book', default='',
                     help='YES 买一/卖一 "29:0.270/0.310,30:0.360/0.390"（下单/清算必须用它）')
     ap.add_argument('--bankroll', type=float, default=2500)
+    ap.add_argument('--grid', default=GRID_SRC_DEFAULT,
+                    choices=('multimodel', 'best_match'),
+                    help='网格基线口径；必须与 model_calib.json 的 bias 同源（默认 multimodel）')
     ap.add_argument('--hold', default='')
     ap.add_argument('--date', default=None)
     ap.add_argument('--json-out', default=None)
     a = ap.parse_args()
 
     L_hat = a.bias if a.l_hat is None else a.l_hat
-    calib, tbl, grid, g_rest = load_context(a.observed_max, a.current, a.hour, a.date)
+    calib, tbl, grid, g_rest = load_context(a.observed_max, a.current, a.hour, a.date,
+                                            a.grid)
     resid_sd = a.resid_sd if a.resid_sd else calib['resid_sd']
     ctx = (calib, tbl, g_rest, a.observed_max, a.current, resid_sd)
     obs_h_after = a.hour
@@ -198,8 +231,10 @@ def main():
 
     print('=' * 78)
     print(f"L 积分器  |  观测 {a.current:.1f}°C @ {a.hour:02d}h  已观测最高 {a.observed_max:.1f}°C")
-    print(f"L ~ N({L_hat:+.2f}, {a.sd_l:.2f})   剩余网格最高 g_rest = {g_rest:.1f}°C"
+    print(f"L ~ N({L_hat:+.2f}, {a.sd_l:.2f})   剩余网格最高 g_rest = {g_rest:.2f}°C"
           f"   残差 sd = {resid_sd:.2f}   分位表 n = {tbl['n']}")
+    print(f"网格口径 = {a.grid}（bias {calib['bias']:+.3f} 与 resid_sd {calib['resid_sd']:.3f}"
+          f" 均按 7 模式平均校准 → 必须同源）")
     print('=' * 78)
 
     pr_model, rows = integrate(L_hat, a.sd_l, ctx)
