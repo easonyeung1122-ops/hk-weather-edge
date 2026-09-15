@@ -26,7 +26,7 @@ Polymarket「香港最高气温」市场 Edge 计算器
 import argparse, json, math, os, re, sys, time, datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "0.16.21"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
+VERSION = "0.16.22"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
 
 # Kelly 缩放：满 Kelly 波动太大、且概率本身有 ±5% 量级误差，实操一律打折。
 # 这里用 35% Kelly（原来是 1/4=25%）。
@@ -51,6 +51,42 @@ PEAK_HOUR = 15.5          # 9 月晴天的最后一个尖峰窗口（见 SKILL.m
 # 把 δ 的 1σ 取成**与 δ 成比例**（相对误差 80%）：δ 小 → 不确定小，早晨窗口行为几乎不变；
 # δ 大 → 不确定同比例放大，自动消除 δ>need 的饱和。比「δ>0.3 才卷积」的硬阈值平滑。
 DELTA_REL_SIGMA = 0.8     # δ 的相对 1σ（乘 |δ| 得 °C）
+
+# ---- 站点口径的越线概率（v0.16.22，与 l_integrate.bucket_probs_at_L 同源）----
+# watch 路径此前是**网格口径直读**：need 不除放大比、δ 被钳到 −1.00、也没有回落腰斩。
+# 2026-09-15 13:30 实测：站点已冲高 31.4（网格全天峰值仅 29.49），watch 把
+# 「到 32.0°C」报成 3%，而 l_integrate 同口径给 24.4% —— 差 8 倍，且方向相反
+# （watch 说「几乎不可能」，实际是「四分之一」）。两条路径必须同源，否则盘中会自相矛盾。
+R_SCALE_DEFAULT = 2.4     # 站点 R / 网格 R 放大比（station_r_probe.py 同点位实测）
+PULLBACK_FACTOR = 0.5     # 站点自当日峰值回落 ≥0.5°C 时，剩余升温概率腰斩
+PULLBACK_MIN_GAP = 0.5
+
+
+def station_reach_prob(tbl, need_from_mx, mx, cur, g_rest, L,
+                       r_scale=R_SCALE_DEFAULT):
+    """站点口径 P(日终最高 ≥ mx + need_from_mx)。
+
+    与 `l_integrate.bucket_probs_at_L` 的经验 one-touch 支路完全同口径：
+
+    1. **base = running max**（分位表定义 `R = M − running_max(h)`，见
+       `build_remaining_rise.py` 的表头 `def`）。用当前瞬时值当 base 会隐含
+       「已回落的部分会自动涨回去」，回落日把概率压到接近 0。
+    2. **need 除以放大比 k_R**：表是 ERA5 网格口径，站点尖峰比网格尖 k_R 倍。
+    3. **站点越过网格全天峰值时 δ 归零**：网格的「午后塌陷」是它自己的，不再是
+       关于今天的信号；旧实现让 δ 被钳到 −1.00，把口径失效转成硬惩罚。
+    4. **回落 ≥0.5°C 时 ×0.5**（VHHH 9 月实测 51.5% → 25.8%）。
+    """
+    if not tbl:
+        return None
+    overshoot = mx - (g_rest + L)
+    if overshoot > 0:
+        delta_g = 0.0
+    else:
+        delta_g = max(-1.0, min(1.0,
+                                ((g_rest + L) - mx) / r_scale - tbl.get('mean', 0.0)))
+    pull = PULLBACK_FACTOR if (mx - cur) >= PULLBACK_MIN_GAP else 1.0
+    return pull * cdf_upper_delta(tbl, need_from_mx / r_scale - delta_g,
+                                  DELTA_REL_SIGMA * abs(delta_g))
 
 
 def flicker_p_cross(d, steps_left, sigma=SIGMA_FLICKER):
@@ -999,30 +1035,35 @@ def watch():
                     #   宽松口径 need = 29.0 − 28.7 = 0.3 → 网格 1.0%
                     # 两者相差数倍到数十倍，**分歧本身就是信息**：给单一数字等于藏起口径风险。
                     # 主输出用严格口径（数学正确）；并列打印宽松口径作为「hko_t 可能陈旧」的对照。
-                    _base_cur = hko_t if hko_t is not None else intraday_mx
-                    _base_mx = intraday_mx if intraday_mx is not None else hko_t
-                    need = b - _base_cur
-                    need_mx = b - _base_mx if _base_mx is not None else need
+                    # ——— need 的基准口径（v0.16.22 定案）———
+                    # 分位表的原生定义是 R(h) = M − **running_max(h)**
+                    # （`build_remaining_rise.py` 表头 "def"，与 SKILL.md 一致）。
+                    # 旧实现拿当前瞬时值当基准，隐含「已回落的部分会自动涨回去」，
+                    # 回落日把概率压到接近 0 —— 09-15 13:30（站点 30.2 / 峰值 31.4）
+                    # 正是这种日子：旧口径说「到 32.0 几乎不可能」，实际是「四分之一」。
+                    _base = intraday_mx if intraday_mx is not None else hko_t
+                    need = b - _base
                     if tbl is not None and intraday_mx is not None:
-                        # δ 当随机量（1σ = DELTA_REL_SIGMA×|δ|），消除 δ>need 的 99% 饱和
-                        prob = cdf_upper_delta(tbl, need - delta,
-                                               DELTA_REL_SIGMA * abs(delta))
+                        # 站点口径（与 l_integrate.bucket_probs_at_L 同源）：
+                        # need÷放大比 + 越过网格峰值时 δ 归零 + 回落 ≥0.5°C 腰斩
+                        prob = station_reach_prob(
+                            tbl, need, intraday_mx,
+                            hko_t if hko_t is not None else intraday_mx, g_rest, L)
+                        prob_grid = cdf_upper_delta(tbl, need - delta,
+                                                    DELTA_REL_SIGMA * abs(delta))
                     else:
+                        prob = prob_grid = None
+                    if prob is None:
                         # 回退：气候表 + 正态（旧行为，仅当分位表缺失时）
                         rm_ = d['mean'] + (calib['bias'] - cur_bias)
                         prob = (1 - norm_cdf((need - rm_) / d['sd'])) if d['sd'] > 0 \
                             else (1.0 if need <= rm_ else 0.0)
+                        prob_grid = prob
                     probs_out[b] = prob
-                    if abs(need_mx - need) > 0.05:
-                        prob_mx = cdf_upper_delta(tbl, need_mx - delta,
-                                                  DELTA_REL_SIGMA * abs(delta)) \
-                            if (tbl is not None and intraday_mx is not None) else prob
-                        print(f"        到 {b}.0°C  需再升 {need:+.1f}°C（基准=当前 "
-                              f"{_base_cur:.1f}）→ 概率约 {prob:.0%}"
-                              f"   ⓘ 若以峰值 {_base_mx:.1f} 起算：{need_mx:+.1f}°C → "
-                              f"{prob_mx:.0%}（站点已回落，后者隐含「回到峰位」，非原生口径）")
-                    else:
-                        print(f"        到 {b}.0°C  需再升 {need:+.1f}°C  → 概率约 {prob:.0%}")
+                    print(f"        到 {b}.0°C  需再升 {need:+.1f}°C（基准=已观测最高 "
+                          f"{_base:.1f}）→ 站点口径 {prob:.0%}"
+                          f"   ⓘ 网格口径下限 {prob_grid:.0%}（表是 25km 网格，"
+                          f"尖峰被抹平 k={R_SCALE_DEFAULT:.1f} 倍，以下限自居）")
                 _log_forecast(today, rt, hh, intraday_mx, pred, probs_out)
                 print("     ⚠️ 阴雨/雷暴日会显著低于此估计；若午后雨已到，以上即为上限")
     except Exception as e:

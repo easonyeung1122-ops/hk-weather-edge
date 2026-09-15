@@ -225,6 +225,15 @@ def main():
     for g in (0.0, 0.5, 1.0):
         report(f'  回落 ≥{g:.1f}°C', probe_station(s_rec, cond_gap=g), (0.5, 1.0, 1.6))
 
+    # 🚨 v0.16.22：VHHH ASOS 是**整数分辨率**，阈值 < 1°C 全部退化
+    _allv = [v for o in s_days.values() for v in o.values()]
+    if _allv and all(abs(v - round(v)) < 1e-9 for v in _allv):
+        print('\n⚠ VHHH ASOS 是**整数分辨率**（小数部分全为 0，'
+              f'{len(_allv)} 条样本）→')
+        print('   「回落 ≥0.5」与「≥1.0」切出的是**同一个子集**（所以上面两行 n 相同），')
+        print('   P(R≥0.6) 在这个数据上**根本不可分辨**。只能引用 ≥1.0°C 的整数阈值；')
+        print('   需要 0.1°C 分辨率请换数据源（HKO 逐时站史，目前没有公开源）。')
+
     if a.rm is not None and a.cur is not None:
         gap = a.rm - a.cur
         print(f'\n【今日（结算站 HKO）】rm={a.rm:.1f}  cur={a.cur:.1f}  回落 {gap:.1f}°C')
@@ -232,7 +241,9 @@ def main():
         for b in range(int(a.rm) + 1, int(a.rm) + 3):
             need = b - a.rm
             p = 100 * sum(1 for v in base['R'] if v >= need) / base['n']
-            print(f'   结算档 ≥{b}: 需再升 {need:.1f}°C → VHHH 站点口径 {p:.1f}%')
+            print(f'   结算档 ≥{b}: 需再升 {need:.1f}°C → VHHH 站点口径 {p:.1f}%'
+                  + ('   ⚠ need <1°C，落在整数数据的不可分辨区，'
+                     '实际等价于「再升 ≥1.0°C」' if need < 1.0 else ''))
         print('   ⓘ 这是**机场站**的绝对值；HKO 的 R 比 VHHH 小（网格 R 0.13 vs 0.25），'
               '\n     跨站点外推要打折，尾档尤其 —— 详见 SKILL.md「站点口径 R 的放大比」。')
 
