@@ -52,6 +52,17 @@ OM_HR_MULTI = ("https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude=
                "&timezone=Asia%2FShanghai&models=" + H.MODELS)
 GRID_SRC_DEFAULT = 'multimodel'
 
+# —— v0.16.21：把网格口径的 R 表折算到站点口径 ——
+# `remaining_rise_cdf.json` 是 ERA5 25km 网格口径，网格把单点日内尖峰平滑掉，
+# 「13 时之后还能升多少」被压得比真实站点小得多。同点位实测（VHHH 站 vs ERA5@VHHH，
+# 2015–2025 九月，n≈330）：日较差只差 1.39 倍，而 R13 差 **2.41 倍** —— 网格不是
+# 等比压缩，它专吃尖峰。用 `scripts/station_r_probe.py` 复算。
+# ⚠ 不要拿「ERA5@HKO 点 vs VHHH 站」相除（会得到 4.7），那混进了站点差。
+R_SCALE_DEFAULT = 2.4
+# 站点已从当日峰值回落 ≥0.5°C 时，剩余升温概率腰斩（VHHH 9 月：51.5% → 25.8%）
+PULLBACK_FACTOR = 0.5
+PULLBACK_MIN_GAP = 0.5
+
 
 def norm_pdf(x, mu, s):
     return math.exp(-0.5 * ((x - mu) / s) ** 2) / (s * math.sqrt(2 * math.pi))
@@ -99,21 +110,39 @@ def load_context(observed_max, current, hour, date_iso=None, grid_src=GRID_SRC_D
 
 def bucket_probs_at_L(L, ctx):
     """给定单个 L，返回 {档位: 概率}（经验 one-touch 与正态截断各半）。"""
-    calib, tbl, g_rest, mx, cur, resid_sd = ctx
+    calib, tbl, g_rest, mx, cur, resid_sd = ctx[:6]
+    r_scale = ctx[6] if len(ctx) > 6 else R_SCALE_DEFAULT
     pred = max(mx, g_rest + L)
-    rho_hat = (g_rest + L) - mx
-    delta = max(-1.0, min(1.0, rho_hat - tbl.get('mean', 0.0)))
+    rho_hat = (g_rest + L) - mx                    # 站点口径：模型预测峰值 − 已观测最高
+    overshoot = mx - (g_rest + L)                  # >0 = 站点已越过网格全天峰值
+    if overshoot > 0:
+        # 🚨 v0.16.21：网格自己的峰值低于实况 → 它的「午后塌陷」是它自己的，
+        #    δ 不再是关于今天的信号。旧实现让 δ 被钳到 −1.00（下限），
+        #    等于断言「今天比气候少升 1°C」，把一个口径失效转成了硬惩罚。
+        #    此时退回**纯气候**（δ=0），只保留站点/网格放大比。
+        delta_g = 0.0
+    else:
+        # δ 在网格口径上算：先把站点的 ρ̂ 折成网格刻度，再减网格表的均值
+        delta_g = max(-1.0, min(1.0, rho_hat / r_scale - tbl.get('mean', 0.0)))
+    delta = delta_g * r_scale                      # 对外仍报站点口径的等效 δ
 
-    # —— 经验 one-touch：P(越线 b.0) = P(R ≥ b − 当前值 − δ)，δ 当随机量 ——
+    # —— 经验 one-touch：P(越线 k.0) = P(R ≥ (k − running_max)/k_R − δ) ——
+    # 两点口径（v0.16.21 修正）：
+    #   ① base 必须是 **running max**，不是当前瞬时值 —— 分位表的 R = M − RM(h)；
+    #      用瞬时值会把「已经回落过」当成「还要升那么多」。
+    #   ② R 阈值要除以放大比 k_R：表是网格口径，站点口径的尖峰比网格尖 k_R 倍。
     emp, b = {}, int(math.floor(mx))
+    # 回落条件：站点已从当日峰值回落 ≥0.5°C 时，剩余升温概率**腰斩**
+    # （VHHH 9 月实测 51.5% → 25.8%，n=330/120；v0.16.21）
+    pf = PULLBACK_FACTOR if (mx - cur) >= PULLBACK_MIN_GAP else 1.0
     reach = {}
     for k in range(b, b + 8):
         if k <= mx:
             reach[k] = 1.0
         else:
-            need = k - cur
-            reach[k] = H.cdf_upper_delta(tbl, need - delta,
-                                         H.DELTA_REL_SIGMA * abs(delta))
+            need_g = (k - mx) / r_scale
+            reach[k] = pf * H.cdf_upper_delta(tbl, need_g - delta_g,
+                                              H.DELTA_REL_SIGMA * abs(delta_g))
     for k in range(b, b + 7):
         emp[k] = max(0.0, reach[k] - reach[k + 1])
 
@@ -219,13 +248,15 @@ def main():
     ap.add_argument('--hold', default='')
     ap.add_argument('--date', default=None)
     ap.add_argument('--json-out', default=None)
+    ap.add_argument('--r-scale', type=float, default=R_SCALE_DEFAULT,
+                    help='站点 R / 网格 R 放大比（v0.16.21，默认 2.4；1.0 = 退回旧口径）')
     a = ap.parse_args()
 
     L_hat = a.bias if a.l_hat is None else a.l_hat
     calib, tbl, grid, g_rest = load_context(a.observed_max, a.current, a.hour, a.date,
                                             a.grid)
     resid_sd = a.resid_sd if a.resid_sd else calib['resid_sd']
-    ctx = (calib, tbl, g_rest, a.observed_max, a.current, resid_sd)
+    ctx = (calib, tbl, g_rest, a.observed_max, a.current, resid_sd, a.r_scale)
     obs_h_after = a.hour
     grid_after = max((v for h, v in grid.items() if h >= obs_h_after), default=None)
 

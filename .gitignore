@@ -27,4 +27,7 @@ watch.log
 watch.bat
 *.log
 scripts/data/_era5_hourly_cache.json
+# v0.16.21：站点口径 R 探针的两份大缓存（可重建，勿入库；station_r_probe.py --refresh 会重下）
+scripts/data/_vhhh_asos.csv
+scripts/data/_era5_vhhh.json
 .watch_loop.pid

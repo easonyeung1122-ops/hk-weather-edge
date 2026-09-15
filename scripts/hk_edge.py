@@ -26,7 +26,7 @@ Polymarket「香港最高气温」市场 Edge 计算器
 import argparse, json, math, os, re, sys, time, datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "0.16.20"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
+VERSION = "0.16.21"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
 
 # Kelly 缩放：满 Kelly 波动太大、且概率本身有 ±5% 量级误差，实操一律打折。
 # 这里用 35% Kelly（原来是 1/4=25%）。
@@ -497,15 +497,23 @@ def _cold_pool_path():
 
 
 def _cold_gap_from_logs(date_iso):
-    """从当日 0.1°C 实况序列里**重建**「当日最高 − 当日最低」落差。
+    """从当日 0.1°C 实况序列里**重建**「从日内已见峰值回落了多少」。
 
     v0.16.6 兜底：`cold_pool_state.json` 是缓存、会被误删；`obs_1min_log.json` 是
     每 10 分钟由 `--watch` 追加的原始序列，**不会因一次不带 --watch 的运行而丢失**。
     2026-09-14 14:23 实测：删掉状态文件后单跑主表，脚本按即时值算落差只剩 0.1
     → 冷池作废静默失效。这条兜底就是为这个场景写的。
 
-    取 running max 与 running min 的差：冷池日必然留下「峰后深谷」的形状，
-    只要序列里出现过 ≥0.5 的落差就说明当天被压下去过。跨日自动作废。
+    🚨 **v0.16.21 修定义（这是本工具史上最隐蔽的一个假阳性）**：
+    旧实现取 `max(vals) - min(vals)` —— 那是**日较差**，不是回落。
+    序列从早上 08–09 时的**日最低附近**开始，于是任何晴热天的日较差都 >3°C，
+    兜底路径会在**每个正常热日**触发冷池作废。
+    2026-09-15 实测：记录下来的 `gap = 3.7`，恰好等于 `31.3（12:50 峰） − 27.6（08:50 晨低）`
+    —— 当天**从未**出现过 3.7°C 的回落（13:00 回落 1.2°C 是真实的那一次，但当时还没写入序列）。
+    拿着这个幻影把主表 31/32/33 三档整段作废，整轮分析被一个不存在的事件带偏。
+
+    正确口径 = **最大回撤**：`max_t (running_max(t) − value(t))`，只在「升上去又被打下来」
+    的日内形状上取值。任何单调上升的一天恒为 0。
     """
     for _loader in ('_load_1min_log',):
         try:
@@ -517,7 +525,13 @@ def _cold_gap_from_logs(date_iso):
         vals = [pt.get('hko') for pt in log.get('points', [])
                 if pt.get('hko') is not None]
         if len(vals) >= 2:
-            return round(max(vals) - min(vals), 3)
+            rm, gap = vals[0], 0.0
+            for v in vals:
+                if v > rm:
+                    rm = v
+                elif rm - v > gap:
+                    gap = rm - v
+            return round(gap, 3)
     return None
 
 
@@ -1246,21 +1260,41 @@ def main():
         except Exception:
             fl_cur = None
         if fl_cur is not None:
+            # v0.16.21 修 bug：冷池 gap 的两个端点必须**同源同刻**。
+            # 旧实现拿 `floor_max`（`load_observed_max()`，三源取最大，可能来自延迟仅
+            # 数十秒的官方 Max-Since-Midnight）去减 `fl_cur`（来自延迟 10–25 分钟的
+            # 0.1°C 分区 CSV），两个源的更新时刻不同 → 在快速升温/回落的转折点会造出
+            # **幻影落差**。2026-09-15 实测：站点全天最高 31.4，13:00 已回落到 30.2，
+            # 而 `cold_pool_state.json` 记下的是 **3.7°C** 的落差 —— 拿它作废主表
+            # 31/32/33 三档，整轮分析被一个不存在的事件带偏。
+            # 修正：gap 一律用「1 分区 CSV 序列自己的 running max − 同一序列的当前值」；
+            # 只有确认 `floor_max` 与 `fl_cur` 同源（官方源缺失时的兜底也一样）
+            # 时才允许用 `floor_max`。
+            fl_rm = None
+            for _fn in ('load_1min_max',):
+                try:
+                    fl_rm = globals()[_fn]()
+                except Exception:
+                    fl_rm = None
+            if fl_rm is None:
+                # 拿不到序列 max → 只有两端同源才算，否则 gap 置 0（宁可不作废）
+                fl_rm = floor_max if _OBS_MAX_SRC in (None, '分区CSV-runningMax') else None
             # v0.16.6：作废的标的不是「当前」落差，而是「今天曾经被打下去过」。
             # 2026-09-14 实测：13:36 落差 1.0 触发作废；14:03 落差缩到 0.3（28.7−28.4）
             # → 若按当前值判，旧作废被静默解除，而残余不确定性（1 小时观测滞后、
             #   14:30 雷暴警告未到期）恰好在那个时刻最大。故改为**日内记忆**。
             _cold_gap = _load_cold_pool_gap(today) or 0.0
-            if (floor_max - fl_cur) > _cold_gap:
-                _cold_gap = floor_max - fl_cur
+            if fl_rm is not None and (fl_rm - fl_cur) > _cold_gap:
+                _cold_gap = fl_rm - fl_cur
             _save_cold_pool_gap(today, _cold_gap)
             if _cold_gap > 0.5:
                 _cold_pool = True
-                _cold_relaxed = (floor_max - fl_cur) <= 0.5
-                _now_gap = floor_max - fl_cur
+                _cold_relaxed = (fl_rm is not None and (fl_rm - fl_cur) <= 0.5)
+                _now_gap = (fl_rm - fl_cur) if fl_rm is not None else float('nan')
                 _cold_reason = (f"今日曾出现 {_cold_gap:.1f}°C 的回落"
                                 f"（日内记忆峰值落差；当前 {fl_cur:.1f}°C vs "
-                                f"当日最高 {floor_max:.1f}°C，即时落差 {_now_gap:.1f}°C"
+                                f"同源序列最高 {(fl_rm if fl_rm is not None else float('nan')):.1f}°C"
+                                f"，即时落差 {_now_gap:.1f}°C"
                                 + ("，冷池已退但作废不解除" if _cold_relaxed
                                    else "，仍在冷池中") + "）")
                 _vb = int(math.floor(floor_max))
