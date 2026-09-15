@@ -26,7 +26,7 @@ Polymarket「香港最高气温」市场 Edge 计算器
 import argparse, json, math, os, re, sys, time, datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "0.16.12"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
+VERSION = "0.16.16"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
 
 # Kelly 缩放：满 Kelly 波动太大、且概率本身有 ±5% 量级误差，实操一律打折。
 # 这里用 35% Kelly（原来是 1/4=25%）。
@@ -851,16 +851,57 @@ def watch():
                 # 制造系统性偏冷：当天实测偏差长期维持在 +2.4 而不回归到 +1.01，
                 # 封顶等于硬砍掉 1.4°C（2026-09-10 上午 P32 被市场一路打脸就是这么来的）。
                 # 改用「今日已采样时段的中位偏差」抗单点噪声，只留一个宽 sane 带。
-                devs = []
+                # —— 站点偏差的两套口径（v0.16.15）——
+                # 网格值是**整点瞬时值**，而采样点是任意 10 分钟边界。早间升温 ≈ +1.5°C/h，
+                # 「采样点 − 整点网格」天生正偏：2026-09-15 实测整点对齐中位 −0.30°C，
+                # 而错位中位 +0.60°C，差 0.9°C > 残差 sd 0.76 → 点估计被抬高近 1°C。
+                # 故 L 用「把站点序列**线性插值到整点**后再减网格」，并把旧口径并列打印。
+                def _mins(s):
+                    try:
+                        return int(s[11:13]) * 60 + int(s[14:16])
+                    except (TypeError, ValueError, IndexError):
+                        return None
+                samp = sorted((( _mins(p['t']), float(p['hko']))
+                               for p in pts if p.get('hko') is not None
+                               and _mins(p['t']) is not None))
+                devs_naive = []
                 for p in pts:
                     try:
                         ph = int(p['t'][11:13])
                     except (TypeError, ValueError):
                         continue
                     if ph in grid_by_h:
-                        devs.append(p['hko'] - grid_by_h[ph])
+                        devs_naive.append(p['hko'] - grid_by_h[ph])
+                devs = []
+                for h in sorted(grid_by_h):
+                    tm = h * 60
+                    if tm < samp[0][0] or tm > samp[-1][0]:
+                        continue          # 整点落在采样区间外 → 插值无意义，跳过
+                    for i in range(1, len(samp)):
+                        t0, v0 = samp[i - 1]
+                        t1, v1 = samp[i]
+                        if t0 <= tm <= t1:
+                            at = v0 if t1 == t0 else v0 + (v1 - v0) * (tm - t0) / (t1 - t0)
+                            devs.append(at - grid_by_h[h])
+                            break
+                devs_naive.sort()
                 devs.sort()
-                robust_bias = devs[len(devs) // 2] if len(devs) >= 3 else cur_bias
+                if len(devs) >= 3:
+                    robust_bias = devs[len(devs) // 2]
+                elif devs:
+                    # 整点对齐样本只有 1–2 个时取均值：口径干净优先于抗噪，
+                    # 单点噪声由 delta 限幅与后续概率卷积吸收
+                    robust_bias = sum(devs) / len(devs)
+                elif len(devs_naive) >= 3:
+                    robust_bias = devs_naive[len(devs_naive) // 2]
+                else:
+                    robust_bias = cur_bias
+                _naive_med = (devs_naive[len(devs_naive) // 2]
+                              if devs_naive else None)
+                if _naive_med is not None and abs(_naive_med - robust_bias) > 0.2:
+                    print(f"     ⓘ 整点对齐修正：错位中位偏差 {_naive_med:+.2f} → "
+                          f"整点对齐 {robust_bias:+.2f}°C（n={len(devs)}；"
+                          f"早间升温期错位口径一律虚高）")
                 fill_bias = min(max(robust_bias, calib['bias'] - 1.0),
                                 calib['bias'] + 2.5)
                 mx_rec = mx
@@ -885,10 +926,11 @@ def watch():
                 #           曲线，不是气候平均——晚峰日（2026-09-08）也能给出真实剩余升温。
                 # 剩余不确定性取历史经验分位表：不假设正态、不需要手调"过峰守卫"。
                 # 午后 g_rest 单调下降，pred 会自然收敛到已观测最高（吸收态）。
-                # 今日水位 L：用**已采样时段的中位偏差**，不用单点。
+                # 今日水位 L：用**整点对齐后**的多点偏差（v0.16.15 起），不用单点、不用错位采样。
                 # 单点会把 10 分钟级的站点抖动当成水位变化（13:20 L=+2.50 → 13:30 站点
-                # 掉 0.3°C 就变成 +2.20），直接污染 ρ̂ 与 δ。
-                L = robust_bias if len(devs) >= 3 else cur_bias
+                # 掉 0.3°C 就变成 +2.20），直接污染 ρ̂ 与 δ；
+                # 错位采样（样本在整点下半段）在早间升温期把 L 系统性抬高近 1°C。
+                L = robust_bias
                 g_rest = max((v for h, v in grid_by_h.items() if h >= hh), default=None)
                 tbl = None
                 if rcdf:
@@ -907,7 +949,7 @@ def watch():
                         else (float(intraday_mx) if intraday_mx is not None else None))
                 print(f"\n  📈 日内外推（one-touch：剩余升温经验分布）")
                 print(f"     实测{hko_t}°C / 网格{grid_now}°C → 今日水位 L = {L:+.2f}"
-                      f"（单点 {cur_bias:+.2f}，气候 {calib['bias']:+.2f}，均不回归）")
+                      f"（整点对齐中位；单点 {cur_bias:+.2f}，气候 {calib['bias']:+.2f}）")
                 if g_rest is not None:
                     print(f"     {hh}时后网格最高 {g_rest:.1f}°C（今日模式日变化）"
                           f" → 站点预测 {g_rest + L:.2f}°C，"
