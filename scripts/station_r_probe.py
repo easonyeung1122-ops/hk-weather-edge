@@ -117,8 +117,9 @@ def station_r(days, month, cut_min):
         cur = at(o, cut_min)
         if cur is None:
             continue
-        rec.append({'d': d, 'rm': max(up.values()), 'cur': cur,
-                    'R': max(o.values()) - max(up.values()),
+        _rm = max(up.values())
+        rec.append({'d': d, 'rm': _rm, 'cur': cur, 'gap': _rm - cur,
+                    'R': max(o.values()) - _rm,
                     'rng': max(o.values()) - min(o.values())})
     return rec
 
@@ -201,6 +202,21 @@ def main():
     g_vhhh = grid_r(load_era5(ERA5_VHHH, is_cache=False), a.month, a.hour)
     g_hko = grid_r(load_era5(ERA5_HKO, is_cache=True), a.month, a.hour)
 
+    # 🚨 v0.16.23：k 不是常数，随小时单调变化 —— 用 k 必须报时刻
+    print('\n【放大比 k 随时段变化】—— k 随小时单调上升，报 k 必须带时刻（v0.16.23）')
+    print('   时刻   站R均值   网R均值     k')
+    _ev = load_era5(ERA5_VHHH, is_cache=False)
+    for hh in range(max(6, a.hour - 3), min(20, a.hour + 3)):
+        _sr = station_r(s_days, a.month, hh * 60)
+        _gr = grid_r(_ev, a.month, hh)
+        if not _sr or not _gr:
+            continue
+        _mr, _mg = st.mean([r['R'] for r in _sr]), st.mean([r['R'] for r in _gr])
+        _mark = '  ← 本时段' if hh == a.hour else ''
+        print(f'   {hh:02d}时   {_mr:6.2f}   {_mg:6.2f}   {_mr/_mg:5.2f}{_mark}')
+    print('   ⓘ 同日 13 时 k=2.41 而 14 时 k=2.64 —— 网格午后的塌陷比站点更陡，'
+          '\n     所以越晚 k 越大。拿旧时刻的 k 配新时刻的 need 会系统性高估。')
+
     print('\n【放大比 k = R_站 / R_网】—— 🚨 必须同点位，否则 k 会被站点差污染')
     for tag, g, s in (('同点位 VHHH', g_vhhh, s_rec),):
         if not g or not s:
@@ -221,9 +237,27 @@ def main():
               '\n      正确做法：k 取同点位值，再用日较差比把 k 外推到 HKO。')
 
     # ---- 回落条件 ----
-    print('\n【条件化：13 时相对当日 running max 的回落（站点）】')
+    print(f'\n【条件化：{a.hour} 时相对当日 running max 的回落（站点）】')
     for g in (0.0, 0.5, 1.0):
         report(f'  回落 ≥{g:.1f}°C', probe_station(s_rec, cond_gap=g), (0.5, 1.0, 1.6))
+
+    # 🚨 v0.16.23：gap 是比「是否回落过」更强的条件变量（同日 3.2–4.4 倍分裂）
+    print(f'\n【gap × rm 分档：{a.hour} 时之后从当前 rm 再升 k 档的实测频率】')
+    print('   rm   n(≤0.5)  P(升1档)  P(升2档)  P(升3档)  |  n(>0.5)  P(升1档)  P(升2档)')
+
+    def _f(xs, k):
+        return 100.0 * sum(1 for r in xs if r['R'] >= k) / len(xs) if xs else float('nan')
+
+    for r0 in range(int(a.rm) - 2, int(a.rm) + 4):
+        _a = [r for r in s_rec if r['rm'] == r0 and r['gap'] <= 0.5]
+        _b = [r for r in s_rec if r['rm'] == r0 and r['gap'] > 0.5]
+        _mark = '  ←今日' if abs(r0 - a.rm) <= 0.6 else ''
+        print(f'   {r0:>2}   {len(_a):>7}   {_f(_a,1):7.1f}%  {_f(_a,2):7.1f}%  '
+              f'{_f(_a,3):7.1f}%  |  {len(_b):>6}   {_f(_b,1):7.1f}%  {_f(_b,2):7.1f}%{_mark}')
+    print('   ⓘ 2026-09-15 实测：rm=31 层级 gap≤0.5 → 46.4%，gap>0.5 → 10.5%（**4.4 倍**）。'
+          '\n     物理：仍在峰位附近说明混合层没被破坏、14:00 后仍可续升；'
+          '\n     已明显回落说明混合层重建失败，当日峰值大概率定格。'
+          '\n     所以「回落过」不够，要问「**现在**离峰位多远」。')
 
     # 🚨 v0.16.22：VHHH ASOS 是**整数分辨率**，阈值 < 1°C 全部退化
     _allv = [v for o in s_days.values() for v in o.values()]
@@ -236,11 +270,20 @@ def main():
 
     if a.rm is not None and a.cur is not None:
         gap = a.rm - a.cur
-        print(f'\n【今日（结算站 HKO）】rm={a.rm:.1f}  cur={a.cur:.1f}  回落 {gap:.1f}°C')
-        base = probe_station(s_rec, cond_gap=0.5) if gap >= 0.5 else probe_station(s_rec)
+        print(f'\n【今日（结算站 HKO）】rm={a.rm:.1f}  cur={a.cur:.1f}  gap {gap:.1f}°C')
+        # v0.16.23：base 必须**同时**条件化 gap 与 rm 级别（两者合计 4.4 倍分裂）
+        _rows = [r for r in s_rec if abs(r['rm'] - a.rm) <= 0.5
+                 and ((r['gap'] <= 0.5) if gap <= 0.5 else (r['gap'] > 0.5))]
+        print(f'   base = rm∈[{a.rm-0.5:.1f},{a.rm+0.5:.1f}] 且 gap'
+              f'{"≤" if gap <= 0.5 else ">"}0.5  → n={len(_rows)}')
+        if len(_rows) < 8:
+            print('   ⚠ 样本 <8，退回单条件 gap 口径（rm 级别不再约束）')
+            _rows = [r for r in s_rec if (r['gap'] <= 0.5)] if gap <= 0.5 \
+                else [r for r in s_rec if (r['gap'] > 0.5)]
+            print(f'   退回后 n={len(_rows)}')
         for b in range(int(a.rm) + 1, int(a.rm) + 3):
             need = b - a.rm
-            p = 100 * sum(1 for v in base['R'] if v >= need) / base['n']
+            p = 100 * sum(1 for r in _rows if r['R'] >= need) / len(_rows)
             print(f'   结算档 ≥{b}: 需再升 {need:.1f}°C → VHHH 站点口径 {p:.1f}%'
                   + ('   ⚠ need <1°C，落在整数数据的不可分辨区，'
                      '实际等价于「再升 ≥1.0°C」' if need < 1.0 else ''))
