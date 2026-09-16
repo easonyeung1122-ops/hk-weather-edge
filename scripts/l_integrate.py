@@ -38,7 +38,12 @@ import hk_edge as H  # noqa: E402
 
 DATA = H.DATA
 RESID_SD_DEFAULT = 0.76
-SD_L_DEFAULT = 0.60          # L 自身的 1σ（2026-09-15 09h/10h 两个整点样本实测摆动）
+# ⚠ v0.18.0：0.60 这个数**没有统计支持** —— 它来自 2026-09-15 的 09h/10h **两个**整点样本
+# 的摆动（n=2）。按「禁用 n≤5 样本内 sd」的纪律，它只能算占位值，不许当校准结果引用。
+# 保留原值是为了不静默改变输出；替换路径已列入 P2：L 的 sd 应改由**当日 devs 序列的
+# 稳健离散度**（1.4826×MAD，双边对齐后 n≥10）估计，前提是 obs_1min_archive 攒够。
+# 在替换之前，任何「L 很稳」的表述都不成立。
+SD_L_DEFAULT = 0.60
 MKT_WEIGHT = 0.25            # 市场收缩权重
 
 # ⚠ 口径必须统一（2026-09-15 11:20 发现并修复）：
@@ -147,13 +152,16 @@ def bucket_probs_at_L(L, ctx):
         emp[k] = max(0.0, reach[k] - reach[k + 1])
 
     # —— 正态截断：N(pred, resid_sd) 截断到 [mx, ∞) ——
+    # v0.18.0：核由正态改 t(5)（H.t_cdf），与 hk_edge 的主公允表、以及上面的
+    # 经验支路（H.cdf_upper_delta 内部已带 σ 下限 + t 核）保持同源。
+    # 可靠性图：预测 10–20% 的档实际命中 26.7%，两端都比正态厚。
     nrm, lo, tot = {}, int(math.floor(mx)), 0.0
     for k in range(lo, lo + 9):
         lo_edge = max(k, mx)
         if lo_edge >= k + 1:
             nrm[k] = 0.0
             continue
-        p = norm_cdf(k + 1, pred, resid_sd) - norm_cdf(lo_edge, pred, resid_sd)
+        p = H.t_cdf(k + 1, pred, resid_sd) - H.t_cdf(lo_edge, pred, resid_sd)
         nrm[k] = p
         tot += p
     if tot > 0:
@@ -235,7 +243,11 @@ def main():
     ap.add_argument('--current', type=float, required=True)
     ap.add_argument('--hour', type=int, required=True, help='观测时刻 HKT 整点')
     ap.add_argument('--l-hat', type=float, default=None, help='L 点估计（默认取 --bias）')
-    ap.add_argument('--bias', type=float, default=-0.36, help='L 点估计（整点对齐中位）')
+    # v0.18.0：默认值由 -0.36 改为 None。旧默认是 **2026-09-15 当天的水位硬编码**，
+    # 等于把某一天的结果写成所有日子的默认输入 —— 典型的「运气变默认值」。
+    # 现在缺省回落到 model_calib 的气候先验 bias（+1.008），语义唯一、不含任何单日值。
+    ap.add_argument('--bias', type=float, default=None,
+                    help='L 点估计（双边对齐中位，v0.18.0 起；缺省 = 气候先验 bias）')
     ap.add_argument('--sd-l', type=float, default=SD_L_DEFAULT)
     ap.add_argument('--resid-sd', type=float, default=RESID_SD_DEFAULT)
     ap.add_argument('--market', default='', help='YES 中间价（用于一致性检验）"28:0.076,29:0.290"')
@@ -252,9 +264,12 @@ def main():
                     help='站点 R / 网格 R 放大比（v0.16.21，默认 2.4；1.0 = 退回旧口径）')
     a = ap.parse_args()
 
-    L_hat = a.bias if a.l_hat is None else a.l_hat
     calib, tbl, grid, g_rest = load_context(a.observed_max, a.current, a.hour, a.date,
                                             a.grid)
+    # L 缺省 = 气候先验 bias（v0.18.0）。用 `is not None` 判空：0.0 是合法水位，
+    # 旧写法 `a.bias if a.bias else` 会把 0.0 当成「没给」。
+    L_hat = (a.l_hat if a.l_hat is not None
+             else (a.bias if a.bias is not None else calib['bias']))
     resid_sd = a.resid_sd if a.resid_sd else calib['resid_sd']
     ctx = (calib, tbl, g_rest, a.observed_max, a.current, resid_sd, a.r_scale)
     obs_h_after = a.hour

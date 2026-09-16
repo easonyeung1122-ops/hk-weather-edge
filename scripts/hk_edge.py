@@ -26,7 +26,7 @@ Polymarket「香港最高气温」市场 Edge 计算器
 import argparse, json, math, os, re, sys, time, datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "0.17.0"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
+VERSION = "0.18.0"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
 
 # Kelly 缩放：满 Kelly 波动太大、且概率本身有 ±5% 量级误差，实操一律打折。
 # 这里用 35% Kelly（原来是 1/4=25%）。
@@ -50,7 +50,24 @@ PEAK_HOUR = 15.5          # 9 月晴天的最后一个尖峰窗口（见 SKILL.m
 # 2026-09-13 实测：need=0.6、δ=0.77 → 报 99%，当时站点已横盘 2h，可辩护值 ~50–68%。
 # 把 δ 的 1σ 取成**与 δ 成比例**（相对误差 80%）：δ 小 → 不确定小，早晨窗口行为几乎不变；
 # δ 大 → 不确定同比例放大，自动消除 δ>need 的饱和。比「δ>0.3 才卷积」的硬阈值平滑。
+# —— v0.18.0：曾试图给 σ 加下限（0.90 = Δ(h) 的跨日样本外 sd），**已撤回** ——
+# 理由是重复计入：分位表本身就是 R 的**无条件**分布、已含全部偏暖偏冷的日子，
+# 再叠一个 0.9 的下限会把 need=0.5 处从 7% 膨胀到 33%，是**无依据的膨胀**，
+# 比原来的「δ→0 时 σ→0」更危险（后者至少是分位表的诚实读数）。
+# 正解要用 ρ̂ 自身的误差（现有 6 天样本给出 0.75–3.00 的波动，n 太小），
+# 需先攒 obs_1min_archive.json → 见 SKILL.md《精度上限》与 P2 清单。
+# 在拿到该数据之前：**不许给 σ 拍下限，也不许把「δ 小」读成「更有把握」。**
 DELTA_REL_SIGMA = 0.8     # δ 的相对 1σ（乘 |δ| 得 °C）
+
+# ---- t(df=5) 残差核（v0.18.0）----
+# 主公允表的残差与 δ 的噪声此前都用正态。可靠性图（2026-09-16 复盘）显示：预测
+# 10–20% 的档实际命中 26.7% —— **两端都比正态厚**，正态在两个方向都过度自信。
+# 自由度取 5：足以含厚尾，又受 2 阶矩约束（t₅ 的 sd = √(5/3)），不会在尾部放飞。
+# σ 的解释仍是「标准差」，实现上用尺度标准化 x·√(3/5) 代回 t₅。
+T_DF = 5
+_T_SCALE = math.sqrt(T_DF / (T_DF - 2.0)) if T_DF > 2 else 1.0   # √(5/3) ≈ 1.291
+# 分位表 / 任何 sd 的最小可采信样本量：低于此只允许用外部先验值，不许用样本内 sd
+SD_MIN_N = 6
 
 # ---- 站点口径的越线概率（v0.16.22，与 l_integrate.bucket_probs_at_L 同源）----
 # watch 路径此前是**网格口径直读**：need 不除放大比、δ 被钳到 −1.00、也没有回落腰斩。
@@ -270,6 +287,88 @@ def print_next_refresh(now, target, is_today):
 # ---------------------------------------------------------------- 工具
 def norm_cdf(x, mu=0.0, s=1.0):
     return 0.5 * (1 + math.erf((x - mu) / (s * math.sqrt(2))))
+
+
+def t5_cdf(t):
+    """Student-t(ν=5) 的 CDF，闭式（v0.18.0）。
+
+    推证：递推 ∫(1+u²)⁻ⁿ du = u/(2(n−1)(1+u²)ⁿ⁻¹) + (2n−3)/(2n−2)·∫(1+u²)^(1−n) du，
+    得 ∫(1+u²)⁻³du = u(5+3u²)/(8(1+u²)²) + (3/8)·arctan(u)。
+    密度 f₅(t) = 8/(3π√5)·(1+t²/5)⁻³，令 u = t/√5，从 −∞ 积到 t：
+        F₅(t) = 1/2 + arctan(u)/π + u(5+3u²)/(3π(1+u²)²)
+    自检：F₅(0)=0.5、F₅(±∞)→0/1、**F₅(2.015)=0.950**（t₅ 的 95% 分位）。
+    第二个自检是必需的：首版把分子写成 u(3+5u²)，F₅(2.015) 只给 0.939，
+    尾部被提前截断 —— 这种错误单看端点自检发现不了。
+    """
+    u = t / math.sqrt(5.0)
+    return min(1.0, max(0.0,
+        0.5 + math.atan(u) / math.pi
+        + u * (5.0 + 3.0 * u * u) / (3.0 * math.pi * (1.0 + u * u) ** 2)))
+
+
+def t5_ppf(p):
+    """t(5) 的分位函数（二分求逆；只用于预计算固定节点，不进热路径）。"""
+    lo, hi = -1e3, 1e3
+    for _ in range(90):
+        mid = (lo + hi) / 2.0
+        if t5_cdf(mid) < p:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2.0
+
+
+_T5_NODES = None
+
+
+def t5_nodes(n=25):
+    """把 t(5) 展平成 n 个**等概率**节点（权重均等），**归一化到 sd=1**。
+
+    用途：ε ~ t(5) 的卷积。旧实现用 25 个等距 z ∈ [−2.2, 2.2] 配 exp(−z²/2) 权重，
+    那是**正态核**的离散化；换成 t 核不能只改权重，因为 t 的质量分布位置不同。
+    等概率分位点是最自然的取法：每个节点代表 1/n 的概率。
+
+    归一化是必需的：n=25 时最外节点落在 2%/98% 分位（±2.757），尾部被截掉一点，
+    节点序列的实际 sd 是 1.187 而非 t₅ 的 1.291。若直接除以 1.291，卷积核会比标称
+    σ 窄 8% —— 呼叫方（station_reach_prob / cdf_upper_delta）传进来的 σ 就不再是
+    标准差，两个函数的 σ 语义会不一致。这里除以**实测离散度**，保证 σ 严格可解释。
+    """
+    global _T5_NODES
+    if _T5_NODES is None:
+        raw = [t5_ppf((i + 0.5) / n) for i in range(n)]
+        m = sum(raw) / n
+        s = math.sqrt(sum((x - m) ** 2 for x in raw) / n)
+        _T5_NODES = [(x - m) / s for x in raw]
+    return _T5_NODES
+
+
+def t_cdf(x, mu=0.0, s=1.0):
+    """均值为 mu、**标准差**为 s 的 t(df=5) 的 CDF（v0.18.0）。
+
+    t₅ 自身 sd = √(5/3) ≈ 1.291，故先按 z=(x−mu)/s 标准化，再乘回 √(5/3)
+    作为 t₅ 的自变量。这样调用处的 `s` 与旧 `norm_cdf(x, mu, sd)` 同义，
+    只有尾厚不同 —— 便于逐位对照新旧输出。
+    """
+    if s <= 0:
+        return 1.0 if x >= mu else 0.0
+    return t5_cdf((x - mu) / s * _T_SCALE)
+
+
+def sd_guard(sd, n, fallback, label=''):
+    """样本内 sd 的样本量守卫（v0.18.0）。
+
+    复盘结论：**任何 σ 都不得来自 n≤5 的样本内 sd。** n=4 的 Δ 表给出 0.26°C，
+    同一量在 n≈300 的样本外是 0.93–1.06（差 4 倍），由此产生的针尖分布连续两层
+    被市场证伪。n < SD_MIN_N 时改用外部先验 fallback，并把替换打印出来。
+    """
+    if sd is None:
+        return fallback
+    if n is not None and n < SD_MIN_N:
+        if label:
+            print(f"     ⓘ σ 守卫：{label} 样本量 n={n} < {SD_MIN_N}，"
+                  f"样本内 sd={sd:.2f} 不可采信 → 改用先验 {fallback:.2f}°C")
+        return fallback
+    return sd
 
 
 def load_obs(force=False):
@@ -722,12 +821,15 @@ def bucket_probs(target, det, ens, calib, mu_override=None, floor=None, sd_overr
               if members else None)
     mu = det_mean + calib['bias'] if mu_override is None else mu_override
     # resid_sd 是「提前一天」的不确定性；接近收盘时剩余不确定性小得多，可用 --sigma 收窄
+    # v0.18.0：σ 不许来自小样本 —— calib 由 n≥20 的历史回测给出，仍过一遍守卫。
     sd = calib['resid_sd'] if sd_override is None else sd_override
+    sd = sd_guard(sd, calib.get('n'), 0.80, '集合残差 sd')
     # dressed ensemble: 偏差修正后的点估计 + 集合距平 + 残差噪声
     # 但 --sigma 表示「剩余总不确定性」（日内场景）：此时集合距平已过时，直接用单个正态
     draws = [mu] if sd_override is not None else [mu + (x - ens_mean) for x in members]
 
-    lo_b, hi_b = int(math.floor(min(draws) - 3 * sd)), int(math.ceil(max(draws) + 3 * sd))
+    # ±4σ：残差核是 t(5)，3σ 处仍有可观测质量，用 3σ 截断会人为削尾
+    lo_b, hi_b = int(math.floor(min(draws) - 4 * sd)), int(math.ceil(max(draws) + 4 * sd))
     if floor is not None:
         lo_b = max(lo_b, int(math.floor(floor)))
         hi_b = max(hi_b, lo_b)
@@ -737,7 +839,7 @@ def bucket_probs(target, det, ens, calib, mu_override=None, floor=None, sd_overr
         lo_edge = b if floor is None else max(b, floor)
         if lo_edge >= b + 1:
             continue
-        p = sum(norm_cdf(b + 1, x, sd) - norm_cdf(lo_edge, x, sd) for x in draws) / len(draws)
+        p = sum(t_cdf(b + 1, x, sd) - t_cdf(lo_edge, x, sd) for x in draws) / len(draws)
         if p > 0.0005:
             out[b] = p
     s = sum(out.values())
@@ -770,24 +872,32 @@ def cdf_upper(tbl, x):
 
 
 def cdf_upper_delta(tbl, x, sigma):
-    """把模式升水当**随机量**的上尾概率：R_today = R_hist + Δ，Δ ~ N(δ, sigma²)。
+    """把模式升水当**随机量**的上尾概率：R_today = R_hist + Δ，Δ ~ t₅(δ, sigma²)。
 
     旧式 `cdf_upper(tbl, need − δ)` 把 δ 当确定量整体平移，会在 δ > need 时把阈值推到
     分位表最小值(0)以下 → 返回 1−q[0][0] = 99%，等价于「今天几乎必然再升 δ」。这抹掉了
     分位表在 R=0 处的原子（h≥13 有 ~60% 的日子当天最高已经出现），是伪确定性。
 
-    这里对 ε ~ N(0, sigma²) 求平均 E[cdf_upper(tbl, x − ε)]（x = need − δ）。
-    σ→0 退化为旧行为；σ>0 时原子被展宽，δ>need 不再饱和到 99%。
+    这里对 ε 求平均 E[cdf_upper(tbl, x − ε)]（x = need − δ）。σ→0 退化为旧行为。
+
+    **v0.18.0：核由正态改 t(5)**（t5_nodes 的等概率节点）。依据是可靠性图 —— 预测
+    10–20% 的档实际命中 26.7%，两端都比正态厚；同 σ 下 t₅ 把 x=+1.0 处从 15.4% 抬到
+    23.0%、x=−0.5 处从 76.5% 压到 70.4%，正是「中间降、尾部抬」的方向。
+
+    ⚠ **已知缺陷，本次未修（P2）**：σ 仍是相对式 0.8|δ|，**没有下限** —— δ→0 时 σ→0，
+    概率直接退回裸分位表值。曾试过加下限 0.90（= Δ(h) 的跨日样本外 sd），但那会**重复
+    计入**：分位表本身已经是 R 的**无条件**分布、含全部偏暖偏冷的日子，再加 0.9 的下限
+    会把 need=0.5 处从 7% 膨胀到 33%（无依据的膨胀，比原缺陷更危险），故撤回。
+    正解要用 ρ̂ 自身的误差（现有 6 天样本给 0.75–3.00 的波动，n 太小），需先攒
+    obs_1min_archive.json。在此之前**不要**给 σ 拍下限，也**不要**把「δ 小 ⇒ 更有把握」
+    当结论 —— 见 SKILL.md《精度上限》。
     """
-    if not tbl or sigma <= 0:
+    if not tbl:
+        return None
+    if sigma <= 0:
         return cdf_upper(tbl, x)
-    ng, acc, ws = 25, 0.0, 0.0
-    for i in range(ng):
-        z = (i - (ng - 1) / 2.0) / ((ng - 1) / 2.0) * 2.2     # z ∈ [−2.2, 2.2]
-        w = math.exp(-0.5 * z * z)
-        acc += w * cdf_upper(tbl, x - sigma * z)
-        ws += w
-    return acc / ws
+    nd = t5_nodes()
+    return sum(cdf_upper(tbl, x - sigma * z) for z in nd) / len(nd)
 
 
 def watch():
@@ -914,6 +1024,7 @@ def watch():
                 samp = sorted((( _mins(p['t']), float(p['hko']))
                                for p in pts if p.get('hko') is not None
                                and _mins(p['t']) is not None))
+                # —— 旧口径（错位采样）：保留打印，不参与决策 ——
                 devs_naive = []
                 for p in pts:
                     try:
@@ -922,36 +1033,47 @@ def watch():
                         continue
                     if ph in grid_by_h:
                         devs_naive.append(p['hko'] - grid_by_h[ph])
+                # —— v0.18.0：L 改为**双边同时刻对齐**（网格插值到采样时刻）——
+                # 旧版把站温插值到整点再减整点网格，devs 只有「落在采样跨度内的整点」那 1–3 个，
+                # 而 L 的误差恰恰在 ±0.3 量级上调参、主项缺口却有 1.2 —— 在比噪声还小的尺度上调参，
+                # 结果 09-16 09:05 的 watch 报 31.00（误差 −0.20，几乎完美）被 10:01 的
+                # 「整点对齐修正」改成 30.10、10:25 再改到 29.95（误差 −1.25）—— **用噪声覆盖了信号**。
+                # 新口径把网格线性插值到各采样时刻：n 从 1–3 提到采样点数（通常 ≥10），
+                # 且两侧同一时刻比较，"采样点在整点下半段" 的系统性错配从构造上消失，
+                # 不再需要「整点对齐修正」这个补丁。
+                gh = sorted(grid_by_h)
                 devs = []
-                for h in sorted(grid_by_h):
-                    tm = h * 60
-                    if tm < samp[0][0] or tm > samp[-1][0]:
-                        continue          # 整点落在采样区间外 → 插值无意义，跳过
-                    for i in range(1, len(samp)):
-                        t0, v0 = samp[i - 1]
-                        t1, v1 = samp[i]
-                        if t0 <= tm <= t1:
-                            at = v0 if t1 == t0 else v0 + (v1 - v0) * (tm - t0) / (t1 - t0)
-                            devs.append(at - grid_by_h[h])
-                            break
+                if len(gh) >= 2 and samp:
+                    for tm, hv in samp:
+                        if tm < gh[0] * 60 or tm > gh[-1] * 60:
+                            continue          # 网格未覆盖该时刻 → 插值无意义
+                        for i in range(1, len(gh)):
+                            t0, t1 = gh[i - 1] * 60, gh[i] * 60
+                            if t0 <= tm <= t1:
+                                g0, g1 = grid_by_h[gh[i - 1]], grid_by_h[gh[i]]
+                                gi = g0 if t1 == t0 else g0 + (g1 - g0) * (tm - t0) / (t1 - t0)
+                                devs.append(hv - gi)
+                                break
                 devs_naive.sort()
                 devs.sort()
-                if len(devs) >= 3:
+                if len(devs) >= SD_MIN_N:
                     robust_bias = devs[len(devs) // 2]
                 elif devs:
-                    # 整点对齐样本只有 1–2 个时取均值：口径干净优先于抗噪，
-                    # 单点噪声由 delta 限幅与后续概率卷积吸收
-                    robust_bias = sum(devs) / len(devs)
-                elif len(devs_naive) >= 3:
+                    # 样本不足 → 不许用它的中位当水位（n<SD_MIN_N 的样本内统计量是噪声源），
+                    # 直接回落到「观测时刻单点偏差」，并在下面打印说明。
+                    robust_bias = cur_bias
+                elif len(devs_naive) >= SD_MIN_N:
                     robust_bias = devs_naive[len(devs_naive) // 2]
                 else:
                     robust_bias = cur_bias
                 _naive_med = (devs_naive[len(devs_naive) // 2]
                               if devs_naive else None)
-                if _naive_med is not None and abs(_naive_med - robust_bias) > 0.2:
-                    print(f"     ⓘ 整点对齐修正：错位中位偏差 {_naive_med:+.2f} → "
-                          f"整点对齐 {robust_bias:+.2f}°C（n={len(devs)}；"
-                          f"早间升温期错位口径一律虚高）")
+                if len(devs) < SD_MIN_N:
+                    print(f"     ⓘ 水位样本不足（网格插值可用点 n={len(devs)} < {SD_MIN_N}）"
+                          f"→ L 回落单点偏差 {cur_bias:+.2f}°C")
+                elif _naive_med is not None and abs(_naive_med - robust_bias) > 0.2:
+                    print(f"     ⓘ 水位口径对照：旧错位中位 {_naive_med:+.2f} → "
+                          f"双边对齐中位 {robust_bias:+.2f}°C（n={len(devs)}）")
                 fill_bias = min(max(robust_bias, calib['bias'] - 1.0),
                                 calib['bias'] + 2.5)
                 mx_rec = mx
@@ -976,10 +1098,11 @@ def watch():
                 #           曲线，不是气候平均——晚峰日（2026-09-08）也能给出真实剩余升温。
                 # 剩余不确定性取历史经验分位表：不假设正态、不需要手调"过峰守卫"。
                 # 午后 g_rest 单调下降，pred 会自然收敛到已观测最高（吸收态）。
-                # 今日水位 L：用**整点对齐后**的多点偏差（v0.16.15 起），不用单点、不用错位采样。
+                # 今日水位 L：用**双边同时刻对齐**的多点偏差中位（v0.18.0 起），
+                # 不用单点、不用错位采样、也不再用「站温插值到整点」那套 1–3 样本的补丁。
                 # 单点会把 10 分钟级的站点抖动当成水位变化（13:20 L=+2.50 → 13:30 站点
                 # 掉 0.3°C 就变成 +2.20），直接污染 ρ̂ 与 δ；
-                # 错位采样（样本在整点下半段）在早间升温期把 L 系统性抬高近 1°C。
+                # 错位采样（样本落在整点下半段）在早间升温期把 L 系统性抬高近 1°C。
                 L = robust_bias
                 g_rest = max((v for h, v in grid_by_h.items() if h >= hh), default=None)
                 tbl = None
@@ -999,7 +1122,8 @@ def watch():
                         else (float(intraday_mx) if intraday_mx is not None else None))
                 print(f"\n  📈 日内外推（one-touch：剩余升温经验分布）")
                 print(f"     实测{hko_t}°C / 网格{grid_now}°C → 今日水位 L = {L:+.2f}"
-                      f"（整点对齐中位；单点 {cur_bias:+.2f}，气候 {calib['bias']:+.2f}）")
+                      f"（双边对齐中位 n={len(devs)}；单点 {cur_bias:+.2f}，"
+                      f"气候 {calib['bias']:+.2f}）")
                 if g_rest is not None:
                     print(f"     {hh}时后网格最高 {g_rest:.1f}°C（今日模式日变化）"
                           f" → 站点预测 {g_rest + L:.2f}°C，"
@@ -1550,7 +1674,15 @@ def main():
                 elif side == 'N' and b == fl_b0:
                     fair = pc                                       # NO b0：越线反而赢
                 elif side != 'N' and b == fl_b0 + 1:
-                    fair = pc                                       # YES b0+1：越线才赢
+                    # YES b0+1 的中奖条件是峰值落在 [b0+1, b0+2)：必须**同时**满足
+                    # 「越过 b0+1 线」与「不越过 b0+2 线」，单侧越线概率不能当公允价。
+                    # 2026-09-16 10:10 实测 bug：实测 28.9 → fl_b0=28，29 YES 的公允被写成
+                    # pc=100.0%，EV 报 +2122%、建议「持有/可加仓」；而网格公允只有 28.1%。
+                    # 根因：flicker 是**零漂移**随机游走，外推到 +1.1°C 处会把越线概率压到
+                    # 3%（实际上午升温有强正漂移）→ 在这里反而制造新的**乐观**偏差。
+                    # 故用两条线之差，并与网格值取 min，作为保守下界。
+                    _pc_next = flicker_p_cross(fl_d + 1.0, _steps)
+                    fair = min(p, max(0.0, pc - _pc_next))
                 else:
                     pc = None
                 if pc is not None:
