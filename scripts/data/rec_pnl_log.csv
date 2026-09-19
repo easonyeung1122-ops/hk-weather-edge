@@ -62,8 +62,23 @@
 #                    判定依据：① 结算站日内序列（scripts/data/obs_1min_log.json 10 分钟快照）当日最高 31.6 @14:10 起多点触及，
 #                    watch 1 分钟口径记 31.7，两者同落 [31.0 到 32.0) → 31 档；② 收盘后市场 31 档 YES bid 0.997
 #                    （>=0.95 视为已定档）且其余各档 NO 0.999（market_prices.py 2026-09-18 --depth 3）。
-# 2026-09-18 无建议腿入账（台账首例「零腿结算日」）：当日 hk_edge.py 未运行（decision_log.csv 无 09-18 记录）、
+# 2026-09-18 无建议腿入账（台账首例「零腿结算日」）：当日 hk_edge.py 未运行（decision_log.csv 内无任何
+#                    「写入时间戳为 09-18」的行 —— 注意该文件的 target_date 列含未来日，判据必须用第 1 列时间戳）、
 #                    当日会话日志不存在、watch 仅播实况未给 Kelly 仓位 → 无可信来源还原建议流水，按「不臆造」原则留空。
+# 2026-09-18 结算档 31°C 仍为 provisional：官方 Daily Extract（09-19 21:30 复核，XML 仍只出到 09-17）
+#                    尚未出 09-18；判定依据不变（结算站快照最高 31.6 / watch 31.7 / 市场 31 档 YES bid 0.997）。
+# 2026-09-19 结算：官方 Daily Extract（09-19 21:30 复核，XML 已出到 09-17）尚未出 09-19 → settle_status=provisional。
+#                    判定依据：① 结算站日内序列（scripts/data/obs_1min_log.json 10 分钟快照）当日最高 33.1
+#                    （14:20 / 15:00 / 15:30 三次触及），watch 1 分钟口径 Max Since Midnight 记 33.2（16:40），
+#                    两者同落 [33.0 到 34.0) → 33 档；② 收盘后市场 33 档 YES bid/ask = 0.998/0.999
+#                    （>=0.95 视为已定档）且其余各档 NO 0.999（market_prices.py 2026-09-19 --depth 3，
+#                    事件已于 12:00 UTC / 20:00 HKT 收盘，24h 量 85.5k）。
+# 2026-09-19 无建议腿入账（台账第二例「零腿结算日」）：三条独立证据一致 ——
+#                    ① decision_log.csv 无「写入时间戳为 09-19」的行（文件最后一个写入时点为 2026-09-17 14:14）
+#                       → 推荐引擎 hk_edge.py 当日未被运行，不存在带「金额 + 份数」的建议输出；
+#                    ② 当日会话日志（WorkBuddy/*/.workbuddy/memory/2026-09-19.md）全盘不存在；
+#                    ③ 会话检索对 09-19 返回 0 条；当日 watch.log 只播实况与概率、不含 Kelly 段。
+#                    → 按口径 11 留空，不补腿、不臆造；PNL.md 不会出现 09-19 行。
 settle_date,leg,side,bucket,entry_price,cost_usd,settle_bucket,settle_status,outcome,note
 2026-09-09,NO31,NO,31,0.4700,277.30,32,confirmed,win,九月九日结算 32°C；唯一赢腿 +96%，覆盖其余四条亏损
 2026-09-09,YES30,YES,30,0.1921,155.00,32,confirmed,loss,同腿四次加仓 0.370→0.060 的均价口径（无单笔止损线）
