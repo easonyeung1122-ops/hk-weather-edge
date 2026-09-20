@@ -26,7 +26,7 @@ Polymarket「香港最高气温」市场 Edge 计算器
 import argparse, json, math, os, re, sys, time, datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "0.19.12"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
+VERSION = "0.19.13"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
 
 # Kelly 缩放：满 Kelly 波动太大、且概率本身有 ±5% 量级误差，实操一律打折。
 # 这里用 35% Kelly（原来是 1/4=25%）。
@@ -1448,13 +1448,22 @@ def main():
             # 2026-09-14 实测：13:36 落差 1.0 触发作废；14:03 落差缩到 0.3（28.7−28.4）
             # → 若按当前值判，旧作废被静默解除，而残余不确定性（1 小时观测滞后、
             #   14:30 雷暴警告未到期）恰好在那个时刻最大。故改为**日内记忆**。
+            # v0.19.13：比较必须带容差。0.1°C 序列的两个一位小数值相减会有浮点残差
+            # （实测 `32.2 - 31.7 == 0.5000000000000036`），于是「落差恰好 = 0.50°C」
+            # 这个**按设计不该触发**的边界情形会在浮点上被判成 `> 0.5` → 冷池误报，
+            # 把主表 32 档及以上整段作废。2026-09-20 13:00 实际踩到（当日 0mm 雨、UV 8、
+            # 无任何警告，那 0.5°C 只是正午常规振荡，不是对流冷池）。
+            _CPS_EPS = 1e-6
             _cold_gap = _load_cold_pool_gap(today) or 0.0
-            if fl_rm is not None and (fl_rm - fl_cur) > _cold_gap:
+            if fl_rm is not None and (fl_rm - fl_cur) > _cold_gap + _CPS_EPS:
                 _cold_gap = fl_rm - fl_cur
+            # 内存值与落盘值用同一精度（落盘 round(,3)），避免「内存 0.5000000000000036
+            # 但文件里是 0.5」的双口径 —— 那正是本次误报的直接成因。
+            _cold_gap = round(_cold_gap, 3)
             _save_cold_pool_gap(today, _cold_gap)
-            if _cold_gap > 0.5:
+            if _cold_gap > 0.5 + _CPS_EPS:
                 _cold_pool = True
-                _cold_relaxed = (fl_rm is not None and (fl_rm - fl_cur) <= 0.5)
+                _cold_relaxed = (fl_rm is not None and (fl_rm - fl_cur) <= 0.5 + _CPS_EPS)
                 _now_gap = (fl_rm - fl_cur) if fl_rm is not None else float('nan')
                 _cold_reason = (f"今日曾出现 {_cold_gap:.1f}°C 的回落"
                                 f"（日内记忆峰值落差；当前 {fl_cur:.1f}°C vs "
