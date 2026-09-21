@@ -253,7 +253,7 @@ def main():
     ap.add_argument('--market', default='', help='YES 中间价（用于一致性检验）"28:0.076,29:0.290"')
     ap.add_argument('--book', default='',
                     help='YES 买一/卖一 "29:0.270/0.310,30:0.360/0.390"（下单/清算必须用它）')
-    ap.add_argument('--bankroll', type=float, default=2500)
+    ap.add_argument('--bankroll', type=float, default=1000)   # 常规本金 1000（硬规则 25 / v0.23.0；当日另行指定则显式传入）
     ap.add_argument('--grid', default=GRID_SRC_DEFAULT,
                     choices=('multimodel', 'best_match'),
                     help='网格基线口径；必须与 model_calib.json 的 bias 同源（默认 multimodel）')

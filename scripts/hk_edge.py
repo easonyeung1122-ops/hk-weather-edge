@@ -26,7 +26,7 @@ Polymarket「香港最高气温」市场 Edge 计算器
 import argparse, json, math, os, re, sys, time, datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "0.22.5"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
+VERSION = "0.23.0"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
 
 # Kelly 缩放：满 Kelly 波动太大、且概率本身有 ±5% 量级误差，实操一律打折。
 # 这里用 35% Kelly（原来是 1/4=25%）。
@@ -1413,8 +1413,8 @@ def main():
     # 有 edge 就必须给出 Kelly 仓位；未指定本金时按 1000 USDC 估算并明确标注
     bankroll = a.bankroll if a.bankroll else 1000.0
     if not a.bankroll:
-        print(f"本金未指定 → 默认按 {bankroll:.0f} USDC 估算 {KELLY_FRAC:.0%} Kelly "
-              f"下注额（用 --bankroll 覆盖）")
+        print(f"本金未指定 → 按**常规本金** {bankroll:.0f} USDC 估算 {KELLY_FRAC:.0%} Kelly "
+              f"下注额（常规值见 SKILL 硬规则 25；当日另行指定用 --bankroll 覆盖）")
 
     # ---- 冷池日判定（v0.16.5：提前到主表输出之前）----
     # 主公允表 = 「无天气型条件的气候期望点估」+「正态残差」，一个已实现事实都不吃。
