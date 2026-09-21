@@ -26,7 +26,7 @@ Polymarket「香港最高气温」市场 Edge 计算器
 import argparse, json, math, os, re, sys, time, datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "0.22.1"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
+VERSION = "0.22.2"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
 
 # Kelly 缩放：满 Kelly 波动太大、且概率本身有 ±5% 量级误差，实操一律打折。
 # 这里用 35% Kelly（原来是 1/4=25%）。
@@ -844,7 +844,13 @@ def bucket_probs(target, det, ens, calib, mu_override=None, floor=None, sd_overr
             out[b] = p
     s = sum(out.values())
     out = {k: v / s for k, v in out.items()}
-    return {'mu': mu if floor is None else max(mu, floor), 'spread': spread, 'sd': sd,
+    # v0.22.2 硬规则 26：floor 饱和检测。
+    # mu < floor 时，截断后的分布**完全不含**「还会升温」的信息 —— 它等价于假设
+    # 「从此刻起不再升温」。此时 mu 会被 max(mu, floor) 顶成 floor，输出看起来正常，
+    # 但档位概率（如 32 档 85.7%）是纯假象。必须由调用方显式告警。见 SKILL.md §2.2-硬规则 26。
+    mu_saturated = floor is not None and mu < floor - 1e-9
+    return {'mu': mu if floor is None else max(mu, floor), 'mu_raw': mu,
+            'mu_saturated': mu_saturated, 'spread': spread, 'sd': sd,
             'n_members': len(members), 'det_mean': det_mean, 'floor': floor, 'probs': out}
 
 
@@ -1489,6 +1495,11 @@ def main():
         print(f"\n■ {t} (提前 {lead} 天)  点估计 {r['mu']:.2f}°C{tag}  "
               f"| 集合离散度 {sp}  残差sd {r['sd']:.2f}"
               f"  | HKO官方预报 {hko_map.get(t, '?')}°C{ftag}")
+        if r.get('mu_saturated'):
+            print(f"  🚫 [硬规则26] 点估计被 floor 饱和：模型原始估计 {r['mu_raw']:.2f}°C < 已观测 "
+                  f"{r['floor']}°C → 本分布等价于假设「不再升温」，**全部档位概率作废**。")
+            print(f"     改用同刻实证 R 路径（硬规则23）+ 市场隐含（硬规则24）；"
+                  f"禁止把本表并入多口径对照。")
         hdr = f"  {'档位':>6} {'公允P':>8} {'市场价':>8} {'动作':>14} {'EV':>7}"
         hdr += f" {f'{KELLY_FRAC:.0%}Kelly(金额/份数)':>22}"   # 有 edge 就必须给出仓位
         print(hdr + "   分布条")
