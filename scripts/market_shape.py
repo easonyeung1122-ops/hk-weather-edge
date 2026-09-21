@@ -2,14 +2,19 @@
 # -*- coding: utf-8 -*-
 """market_shape.py — 盘口形状的**规范化**正态拟合与 RMS 守卫。
 
-为什么单独做一个脚本：2026-09-21 10:40 轮用**错误的 RMS 算法**得出「市场形状不可用
-（RMS 74%）」，据此弃用市场隐含 σ、改用站点 σ，把一笔入场 edge 从 +2.7% 吹成 +11.6%
-（详见 SKILL.md §2.2-硬规则 24）。本脚本把正确算法固化下来，避免再手算：
+Why this script exists: on 2026-09-21 10:40 a round used a **wrong RMS algorithm** and concluded
+"market shape unusable (RMS 74%)", discarded the market-implied sigma for a site sigma, and inflated
+an entry edge from +2.7% to +11.6% (see SKILL.md section 2.2 hard rule 24). The wrong figure came from a
+**relative-error metric** (residual divided by bucket mid): the thinnest bucket, 34C (only 1.8% of mass),
+alone contributed **99.4%** of the sum of squares and pushed 1.46% up to 64.7%. This script fixes the
+canonical algorithm so it is never hand-computed again:
 
-  1. mid 先**归一化**到 sum=1；
-  2. 拟合与 RMS **用同一组桶**（默认只取流动性桶，见 --buckets）；
-  3. 输出必带**桶集**与**归一化前 sum**，便于复核；
-  4. RMS > 3% 才允许打印「形状不可用」的警告。
+  1. mid is **normalised** to sum=1 first;
+  2. fit and RMS use the **same bucket set** (default: liquid buckets only, see --buckets);
+  3. output always carries the **bucket set**, the **pre-normalisation sum**, and
+     **per-bucket contribution to the residual sum of squares**;
+  4. a bucket contributing > 50% is named explicitly;
+  5. only RMS > 3% prints the "shape unusable" warning.
 
 用法：
     py -3 scripts/market_shape.py --market "31:0.12,32:0.49,33:0.355,34:0.025"
@@ -81,7 +86,19 @@ def fit(mid, buckets, mu_lo=20.0, mu_hi=45.0, sd_lo=0.20, sd_hi=4.0):
 
 
 def fetch_book(date_iso):
-    """复用 market_prices 的取数逻辑，返回 {档位键: YES mid}。"""
+    """复用 market_prices 的取数逻辑，返回 {档位键: YES mid}。
+
+    v0.22.1 修复两处缺陷（2026-09-21 实测 --date 直接崩溃 / 支撑集被静默砍掉）：
+
+    1. `mp._levels()` 返回 **(bids, asks) 二元组**，旧代码当成单个列表用，
+       `if not lv` 对空档位永不触发 → `lv[0][0]` 抛 IndexError。
+       本脚本 v0.22.0 上线后 **--date 路径从未真正跑通过**。
+    2. 旧代码只取 **YES bid**：当天 10 档里有 6 档完全没有 YES 买单（显示 `-`），
+       这些档被 `continue` **静默丢弃** → 支撑集被削 → 违反硬规则 24 自己的前提。
+       做**形状**拟合要的是两侧中间价，与**执行**取价（须用可成交的 ask/bid）是两回事。
+
+    定价优先级：YES (bid+ask)/2 → YES 单边 → 1 − NO (bid+ask)/2 → 1 − NO 单边。
+    """
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import market_prices as mp          # noqa: E402
     import urllib.parse                 # noqa: E402
@@ -103,15 +120,40 @@ def fetch_book(date_iso):
             pairs.append((label, toks[0], toks[1]))
     ids = [t for _, y_, n in pairs for t in (y_, n)]
     batch = mp.books_batch(ids) if ids else {}
-    out = {}
-    for label, ytok, _ in pairs:
-        key = label.replace(" or below", "").replace(" or higher", "+").replace("°C or below", "")
-        key = key.replace("°C or higher", "+").replace("°C", "")
-        lv = mp._levels(batch.get(str(ytok), []), 1)
-        if not lv:
+
+    def side(token):
+        """→ (best_bid, best_ask)；任一侧缺失则为 None。"""
+        bids, asks = mp._levels(batch.get(str(token), {}) or {}, 1)
+        bb = bids[0][0] if bids else None
+        ba = asks[0][0] if asks else None
+        return bb, ba
+
+    out, dropped = {}, []
+    for label, ytok, ntok in pairs:
+        key = (label.replace("°C or below", "").replace(" or below", "")
+               .replace("°C or higher", "+").replace(" or higher", "+")
+               .replace("°C", "").strip())
+        yb, ya = side(ytok)
+        nb, na = side(ntok)
+        px = None
+        if yb is not None and ya is not None:
+            px = (yb + ya) / 2.0
+        elif yb is not None:
+            px = yb
+        elif ya is not None:
+            px = ya
+        elif nb is not None and na is not None:
+            px = 1.0 - (nb + na) / 2.0
+        elif nb is not None:
+            px = 1.0 - nb
+        elif na is not None:
+            px = 1.0 - na
+        if px is None:
+            dropped.append(key)
             continue
-        bid = lv[0][0]
-        out[key] = bid      # 用 bid 做保守的 YES 定价（mid 需 ask，见 market_prices）
+        out[key] = px
+    if dropped:
+        print("[warn] 两侧订单簿全空、已跳过: %s" % ", ".join(dropped), file=sys.stderr)
     return out, e
 
 
@@ -128,7 +170,7 @@ def main():
         mid = parse_market(a.market)
     elif a.date:
         mid, _e = fetch_book(a.date)
-        src = "订单簿 %s（YES bid）" % a.date
+        src = "订单簿 %s（YES/NO 两侧中间价）" % a.date
     else:
         raise SystemExit("[err] 需要 --market 或 --date")
 
@@ -160,14 +202,26 @@ def main():
     print("拟合：μ = %.2f °C   σ = %.2f °C   RMS = %.2f%%   → %s"
           % (mu, sd, rms * 100, "形状可用" if rms * 100 <= RC_USABLE else "⚠ 形状不可用"))
     print()
-    print("%-8s %9s %9s %9s %10s %10s" % ("桶", "mid(归一)", "fit", "差 pp", "NO 公允", "YES 公允"))
+    print("%-8s %9s %9s %9s %10s %10s %8s" % ("桶", "mid(归一)", "fit", "差 pp", "NO 公允", "YES 公允", "贡献%"))
+    ss = sum((fitp[k] - norm[k]) ** 2 for k in buckets) or 1e-12
     for k in buckets:
-        print("%-8s %9.4f %9.4f %+9.2f %10.4f %10.4f"
-              % (k, norm[k], fitp[k], (fitp[k] - norm[k]) * 100, 1 - fitp[k], fitp[k]))
+        print("%-8s %9.4f %9.4f %+9.2f %10.4f %10.4f %7.1f%%"
+              % (k, norm[k], fitp[k], (fitp[k] - norm[k]) * 100, 1 - fitp[k], fitp[k],
+                 (fitp[k] - norm[k]) ** 2 / ss * 100))
+    # 单桶主导守卫：绝对残差口径下也会被某个薄桶带偏，必须点名
+    top = max(buckets, key=lambda k: (fitp[k] - norm[k]) ** 2)
+    share = (fitp[top] - norm[top]) ** 2 / ss * 100
+    if share > 50:
+        print()
+        print("⚠ 单桶主导：`%s` 档占总残差平方和 **%.0f%%**（mid %.4f → fit %.4f）。"
+              % (top, share, norm[top], fitp[top]))
+        print("  该桶只占 %.1f%% 质量，RMS 由它独撑 —— 报 RMS 前须说明，"
+              "并检查是否该把它移出拟合桶集（--buckets）。" % (norm[top] * 100))
     if rms * 100 > RC_USABLE:
         print()
         print("⚠ RMS %.2f%% > %.1f%%：先按硬规则 24 用**相邻另一批盘口交叉验证**，"
-              "确认两批都拟不上再判「不可用」——2026-09-21 的 74% 就是算法错误。" % (rms * 100, RC_USABLE))
+              "确认两批都拟不上再判「不可用」——2026-09-21 的 74% 就是算法错误。"
+              % (rms * 100, RC_USABLE))
 
 
 if __name__ == "__main__":
