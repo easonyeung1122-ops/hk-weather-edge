@@ -26,7 +26,7 @@ Polymarket「香港最高气温」市场 Edge 计算器
 import argparse, json, math, os, re, sys, time, datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "0.22.2"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
+VERSION = "0.22.3"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
 
 # Kelly 缩放：满 Kelly 波动太大、且概率本身有 ±5% 量级误差，实操一律打折。
 # 这里用 35% Kelly（原来是 1/4=25%）。
@@ -1138,6 +1138,10 @@ def watch():
                     raise RuntimeError("无可用外推输入")
                 print(f"     ⇒ 今日峰值估计 {pred:.2f}°C（下限 = 已观测最高 {intraday_mx}°C）"
                       f"  → 众数档 {int(math.floor(pred))}°C")
+                if intraday_mx is not None and pred <= float(intraday_mx) + 1e-9:
+                    print("     🚫 [硬规则26] 点估计被 floor 饱和：网格+水位估计低于已观测最高"
+                          " → 该值等价于假设「不再升温」，**不可当中枢用**；"
+                          "改用同刻实证 R（硬规则23）+ 市场隐含（硬规则24）。")
                 if tbl:
                     print(f"     剩余升温分布: 经验分位 n={tbl['n']}，气候升水 "
                           f"ρ̄={tbl.get('mean', 0):.2f}°C → δ={delta:+.2f}°C"
