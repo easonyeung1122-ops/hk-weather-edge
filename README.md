@@ -1,6 +1,6 @@
 # hk-weather-edge
 
-> 当前版本 **v0.21.2** —— 每次更新的改动见 [CHANGELOG.md](CHANGELOG.md).
+> 当前版本 **v0.22.0** —— 每次更新的改动见 [CHANGELOG.md](CHANGELOG.md).
 
 **每日建议战绩记分牌 → [PNL.md](PNL.md)**（逐日胜/负 + 累计 ROI + 逐腿归因，由 `scripts/rec_pnl.py` 生成）
 
@@ -73,6 +73,7 @@ Gamma 的 `outcomePrices`（最后成交价）和 `bestBid/bestAsk` 都是**延�
 ```bash
 py -3 scripts/market_prices.py 2026-09-07            # 按香港日期取盘口
 py -3 scripts/market_prices.py 2026-09-08 --depth 3  # 多看几档深度
+py -3 scripts/market_shape.py --date 2026-09-21      # 盘口形状的规范拟合（μ/σ/RMS + 市场自评公允价）
 ```
 
 算 EV 用可执行价：买 YES 用 YES 的 **ask**，买 NO 用 **NO token 自己的 ask**（NO 有独立订单簿）。
@@ -106,6 +107,7 @@ references/methodology.md             实证数据 / dressed ensemble 公式 / �
 assets/docs_edge_map.html             完整方法论报告（浏览器可直接打开）
 scripts/hk_edge.py                    主程序
 scripts/market_prices.py              从 CLOB 订单簿取真实可成交价（取价必用）
+scripts/market_shape.py               盘口形状的规范正态拟合（μ/σ/RMS 守卫 + 市场自评公允价）
 scripts/diurnal.py                    生成日内气候升温表（ERA5）
 scripts/fetch_stations.py             下载多站历史 CSV（供 analyze.py）
 scripts/backtest.py / analyze.py / hitrate.py   校准与分析（需 pandas + numpy）
