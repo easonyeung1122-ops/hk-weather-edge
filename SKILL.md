@@ -1,6 +1,6 @@
 ---
 name: hk-weather-edge
-version: 0.23.5
+version: 0.23.6
 description: Polymarket「香港最高气温」日度市场的 edge 计算与实况外推工具。把香港天文台(HKO)开放数据 + Open-Meteo 多模式 NWP 集合转为校准后的摄氏整数档(bucket)公允概率，并与市场价对比输出 EV 与 35% Kelly 仓位建议；`--watch` 模式基于结算站实测 + 日内气候曲线做当日峰值 nowcast。当用户提到「香港气温市场」「最高气温预测」「HKO / 天文台结算」「bucket 概率」「temperature bucket edge」「今天香港会到几度」「 polymarket weather Hong Kong」，或需要判断某个整数档是否值得买 YES / NO 时使用。
 ---
 
@@ -1261,10 +1261,17 @@ h=10:50 的所有外推方法，用同一批历史日（`watch.log` 10:50 站温
 **后果**：日后跑 `review_brier.py` 时，当日午后的 Brier 会是 **0.1097（模型）vs 0.0003（市场）**，
 掩盖真实情况（报告口径下模型当时给的是 96%，几乎与市场一致）。
 **纪律：**
-1. **检测到 `mu_saturated` 时不得写 `decision_log.csv`**，改打印 `[skip-log] floor saturated` ——
-   **代码层待修**；在此之前，人工复核当日午后的 Brier 时**必须先剔除该行**。
+1. **检测到 `mu_saturated` 时不得写 `decision_log.csv`**（**v0.23.6 已落地到代码**：
+   写台账前按 `results[t]['mu_saturated']` 分流，饱和目标日整日拒收并打印
+   `🚫 [硬规则26/31] 拒写 decision_log.csv：...`，非饱和日不受影响）。
+   若在旧台账里见到 floor 饱和时段的记录，人工复核 Brier 时**仍须先剔除该行**。
 2. 报告里**手工构造的分布**（如本日的双轴 R 口径）应回写一行 `--market` 记录，
    否则复盘时「我们对市场说了什么」在结构化数据里是空的。
+3. **`review_brier.py` 复盘前必须先剔除 `target_date − logged_at ≥ 2 天` 的行**
+   （v0.23.6 实测：现有台账 1200 行中 lead=1 共 211 行属正常 D-1 记录，
+   但 **lead ≥ 2 共 25 行**的 `market_p` 与 `target_date` 不匹配 —— 成因是不带 `--date` 运行时
+   `targets` 取未来 7 天、而 `--market` 只描述一天，同一天的盘口价被写进 6 个未来日期。
+   口径待拍板，代码暂未改，只做剔除纪律）。
 
 ##### 当日实测的完整口径排序（供后续同型日参考）
 

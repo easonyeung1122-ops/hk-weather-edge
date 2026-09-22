@@ -26,7 +26,7 @@ Polymarket「香港最高气温」市场 Edge 计算器
 import argparse, json, math, os, re, sys, time, datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "0.23.5"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
+VERSION = "0.23.6"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
 
 # Kelly 缩放：满 Kelly 波动太大、且概率本身有 ±5% 量级误差，实操一律打折。
 # 这里用 35% Kelly（原来是 1/4=25%）。
@@ -1563,9 +1563,15 @@ def main():
             if warns:
                 line += "  " + " ".join(warns)
             print(line + f"   {bar}")
-        top = max(r['probs'].items(), key=lambda x: x[1])
-        print(f"  → 众数档 {top[0]}°C 仅 {top[1]:.1%}: 即使完美预测期望值,"
-              f"命中整数档的概率也不到一半 —— 别把点预报当概率")
+        if not r['probs']:
+            # v0.23.6：floor 高于整条分布的支撑集时 probs 会被清空（原为 ValueError 崩溃）。
+            # 现实中意味着 --observed-max / 日内实测上限异常偏大，必须显式报错而不是崩。
+            print("  → ⚠ 分布为空：已观测下限高于模型分布的全部支撑区间"
+                  "（floor > μ + 4σ）→ 不输出众数档，请核查 --observed-max / intraday_log.json")
+        else:
+            top = max(r['probs'].items(), key=lambda x: x[1])
+            print(f"  → 众数档 {top[0]}°C 仅 {top[1]:.1%}: 即使完美预测期望值,"
+                  f"命中整数档的概率也不到一半 —— 别把点预报当概率")
     if market:
         print("\n  份数 = 建议金额 ÷ 该档单价（买 YES 用市场价 mk，买 NO 用 1−mk）；"
               "下单前按订单簿可执行价重算一次（见 A0）——单价差 1 分钱，份数会差不少。")
@@ -1749,7 +1755,17 @@ def main():
                   f"{fair:>8.1%} {ev_now:>+10.0%}   {adv}")
 
     # 决策留痕：攒够 30 笔就能回头校准自己的命中率（长期真正的 edge 来源）
-    if market:
+    # v0.23.6 硬规则 31（三）：floor 饱和的运行，其分布已被硬规则 26 判「整段作废」
+    # —— 它等价于假设「从此刻起不再升温」，写进台账只会污染日后的 Brier 复盘。
+    # 实证代价：2026-09-22 14:40 轮台账写 P(30档)=0.565，同轮报告给用户的是 96%，
+    # 差 39.5pp；若不拦，当日午后 Brier 会显示模型 0.1097 vs 市场 0.0003，
+    # 掩盖「模型当时几乎与市场一致」的事实。→ 饱和目标日**整日拒收**，其余照常。
+    _sat = [t for t in targets if results[t].get('mu_saturated')]
+    _writable = [t for t in targets if not results[t].get('mu_saturated')]
+    if _sat:
+        print(f"\n🚫 [硬规则26/31] 拒写 decision_log.csv：{', '.join(_sat)} 的分布被 floor 饱和"
+              f"（点估计 ≤ 已观测最高 → 已整段作废）→ 该目标日不计入 Brier 台账")
+    if market and _writable:
         import csv
         lp = os.path.join(DATA, 'decision_log.csv')
         new = not os.path.exists(lp)
@@ -1757,12 +1773,13 @@ def main():
             w = csv.writer(f)
             if new:
                 w.writerow(['logged_at', 'target_date', 'bucket', 'fair_p', 'market_p', 'edge'])
-            for t in targets:
+            for t in _writable:
                 for b, p in sorted(results[t]['probs'].items()):
                     if b in market:
                         w.writerow([dt.datetime.now(TZ).strftime('%Y-%m-%d %H:%M'), t, b,
                                     round(p, 4), market[b], round(p - market[b], 4)])
-        print(f"\n[已记录] {len(market)} 档写入 data/decision_log.csv —— 结算后回来填实际档位做复盘")
+        print(f"\n[已记录] {len(market)} 档写入 data/decision_log.csv"
+              f"（目标日 {', '.join(_writable)}）—— 结算后回来填实际档位做复盘")
 
     if a.html:
         write_html(results, calib, hko_map, market)
