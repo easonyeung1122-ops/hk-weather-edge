@@ -26,7 +26,7 @@ Polymarket「香港最高气温」市场 Edge 计算器
 import argparse, json, math, os, re, sys, time, datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "0.23.9"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
+VERSION = "0.23.10"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
 
 # Kelly 缩放：满 Kelly 波动太大、且概率本身有 ±5% 量级误差，实操一律打折。
 # 这里用 35% Kelly（原来是 1/4=25%）。
@@ -1348,6 +1348,9 @@ def main():
                     help=f'模式/预报类接口的缓存秒数（默认 {CACHE_TTL}s=15分钟；'
                          f'实况与价格永不缓存）')
     ap.add_argument('--no-cache', action='store_true', help='强制实时拉取，绕过缓存')
+    ap.add_argument('--no-log', action='store_true',
+                    help='不写 decision_log.csv（情景/敏感性扫描必须加此参数，'
+                         '否则同键多值会污染 Brier 台账）')
     ap.add_argument('--html', action='store_true', help='额外输出 HTML 报告')
     ap.add_argument('--version', action='version', version=f'hk-weather-edge {VERSION}')
     a = ap.parse_args()
@@ -1765,7 +1768,7 @@ def main():
     if _sat:
         print(f"\n🚫 [硬规则26/31] 拒写 decision_log.csv：{', '.join(_sat)} 的分布被 floor 饱和"
               f"（点估计 ≤ 已观测最高 → 已整段作废）→ 该目标日不计入 Brier 台账")
-    if market and _writable:
+    if market and _writable and not getattr(a, 'no_log', False):
         import csv
         lp = os.path.join(DATA, 'decision_log.csv')
         new = not os.path.exists(lp)
@@ -1780,6 +1783,9 @@ def main():
                                     round(p, 4), market[b], round(p - market[b], 4)])
         print(f"\n[已记录] {len(market)} 档写入 data/decision_log.csv"
               f"（目标日 {', '.join(_writable)}）—— 结算后回来填实际档位做复盘")
+    elif market and _writable and getattr(a, 'no_log', False):
+        print(f"\n[--no-log] 本轮为情景/敏感性扫描，未写 decision_log.csv"
+              f"（目标日 {', '.join(_writable)}）")
 
     if a.html:
         write_html(results, calib, hko_map, market)
