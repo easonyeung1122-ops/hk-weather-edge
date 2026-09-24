@@ -11,7 +11,24 @@
 `SKILL.md` frontmatter 的 `version:`、`scripts/hk_edge.py` 的 `VERSION` 常量、
 以及**本文件下面的「当前版本」行**（最容易漏的一处）。
 
-当前版本：**v0.23.12**（`py -3 scripts/hk_edge.py --version` 可查）
+当前版本：**v0.23.13**（`py -3 scripts/hk_edge.py --version` 可查）
+
+## v0.23.13 — 2026-09-24 11:45｜修复跨天轮转把昨日轨迹静默覆盖（代码）
+
+- **根因**：`_load_1min_log()` 在 `date != today` 时返回 `{}`，使调用处的轮转判据
+  `log.get('date') != iso[:10]` **恒为 False** → 紧随其后的 `_archive_1min(log)`
+  是**死代码**，昨日 `points` 被 `json.dump` 直接覆盖。
+- **后果（已发生）**：9/23 的 43 点 1min 结算站轨迹**永久丢失**；
+  `obs_1min_archive.json` 长期只有 09-10 一天 → **P2-3 站点口径尾档重建被卡死**
+  （剩余升温表尾部比站点薄 4.7 倍，攒站点序列是唯一解法）。
+- **修复**：① `_load_1min_log(raw=True)` 绕开跨天作废，轮转路径改用它；
+  ② `intraday_log.json` 同源缺陷一并修 —— 新增 `_archive_intraday()`，按日归档
+  到 `data/intraday_archive.json`（含**全部站点**读数，是硬规则 19 跨站两步换算
+  与「昨日同刻对照法」的逐时档案）。
+- **验证**：隔离测试（`DATA` 重定向到临时目录）—— 造昨日 log → 触发轮转 →
+  archive 正确出现昨日键、新 log 正常开当日，`raw=False` 仍按预期作废。
+- **部分代偿**：`forecast_log.jsonl` 保留 9/23 整十点 `rm` 序列（39 条），
+  整十点粒度的「昨日同刻对照」仍可用；1min 瞬时序列不可恢复。
 
 ## v0.23.12 — 2026-09-24 10:45｜SKILL.md 新增硬规则 32（单腿双开关，文档，代码零改动）
 

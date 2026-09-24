@@ -26,7 +26,7 @@ Polymarket「香港最高气温」市场 Edge 计算器
 import argparse, json, math, os, re, sys, time, datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "0.23.12"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
+VERSION = "0.23.13"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
 
 # Kelly 缩放：满 Kelly 波动太大、且概率本身有 ±5% 量级误差，实操一律打折。
 # 这里用 35% Kelly（原来是 1/4=25%）。
@@ -465,13 +465,21 @@ def _obs1min_path():
     return os.path.join(DATA, 'obs_1min_log.json')
 
 
-def _load_1min_log():
-    """今日的 0.1°C 观测序列（跨天自动作废）。"""
+def _load_1min_log(raw=False):
+    """今日的 0.1°C 观测序列（跨天自动作废）。
+
+    `raw=True` 时**不做跨天作废**，原样返回文件内容 —— 供轮转路径把昨天
+    归档后再开新一天。v0.23.13 修复：此前本函数在日期不符时返回 {}，
+    使 `log.get('date') != iso[:10]` 恒为 False，归档分支成为**死代码**，
+    9/23 的 43 点 1min 轨迹被 json.dump 直接覆盖丢失。
+    """
     p = _obs1min_path()
     if not os.path.exists(p):
         return {}
     try:
         d = json.load(open(p))
+        if raw:
+            return d if isinstance(d, dict) else {}
         today = dt.datetime.now(TZ).date().isoformat()
         return d if d.get('date') == today else {}
     except Exception:
@@ -513,7 +521,7 @@ def fetch_hko_1min(record=True):
     iso = f"{stamp[0:4]}-{stamp[4:6]}-{stamp[6:8]}T{stamp[8:10]}:{stamp[10:12]}:00+08:00"
     if record:
         try:
-            log = _load_1min_log() or {'date': iso[:10], 'points': []}
+            log = _load_1min_log(raw=True) or {'date': iso[:10], 'points': []}
             if log.get('date') != iso[:10]:
                 _archive_1min(log)          # 跨天：先把昨天归档，再开新一天
                 log = {'date': iso[:10], 'points': []}
@@ -546,6 +554,31 @@ def _archive_1min(log):
     if d in arc and len(arc[d]) >= len(log['points']):
         return
     arc[d] = [{'t': pt.get('t'), 'hko': pt.get('hko')} for pt in log['points']]
+    json.dump(arc, open(p, 'w'))
+
+
+def _archive_intraday(log):
+    """把一整天的分区站温快照（含全部站点）归档到 data/intraday_archive.json。
+
+    v0.23.13：与 `_archive_1min` 同源修复 —— 此前 `intraday_log.json` 跨天时
+    直接开新对象，昨日整日轨迹静默丢失。该快照含**全部站点**读数，是硬规则 19
+    （跨站条件频率两步换算）与「昨日同刻对照法」复盘时的唯一逐时站点档案。
+    """
+    if not log or not log.get('points'):
+        return
+    p = os.path.join(DATA, 'intraday_archive.json')
+    arc = {}
+    if os.path.exists(p):
+        try:
+            arc = json.load(open(p))
+        except Exception:
+            arc = {}
+    d = log.get('date')
+    if not d:
+        return
+    if d in arc and len(arc[d]) >= len(log['points']):
+        return
+    arc[d] = log['points']
     json.dump(arc, open(p, 'w'))
 
 
@@ -936,6 +969,7 @@ def watch():
     log_p = os.path.join(DATA, 'intraday_log.json')
     log = json.load(open(log_p)) if os.path.exists(log_p) else {}
     if log.get('date') != today:
+        _archive_intraday(log)      # 跨天：先把昨天归档，再开新一天（v0.23.13）
         log = {'date': today, 'points': []}
     log['points'].append({'t': rt, 'hko': hko_t, 'all': temp})
     json.dump(log, open(log_p, 'w'))

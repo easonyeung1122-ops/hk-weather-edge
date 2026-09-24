@@ -1,6 +1,6 @@
 ---
 name: hk-weather-edge
-version: 0.23.12
+version: 0.23.13
 description: Polymarket「香港最高气温」日度市场的 edge 计算与实况外推工具。把香港天文台(HKO)开放数据 + Open-Meteo 多模式 NWP 集合转为校准后的摄氏整数档(bucket)公允概率，并与市场价对比输出 EV 与 35% Kelly 仓位建议；`--watch` 模式基于结算站实测 + 日内气候曲线做当日峰值 nowcast。当用户提到「香港气温市场」「最高气温预测」「HKO / 天文台结算」「bucket 概率」「temperature bucket edge」「今天香港会到几度」「 polymarket weather Hong Kong」，或需要判断某个整数档是否值得买 YES / NO 时使用。
 ---
 
@@ -2208,8 +2208,11 @@ v0.14.0 写的「中间按 0.5 权重对半折」就是这么错的 —— 9/12 
   任何 `b0+1` 档的 YES 与更高档位，必须走 `remaining_rise_cdf.json`，不得用 flicker 差值外推。
 
 **待办**：① 把 σ_flicker 并进 `remaining_rise_cdf.json` 的**主概率**使用路径
-（现在只覆盖持仓检查那一对档位）；② 补齐 `obs_1min_archive.json` 的每日归档
-—— σ 目前只有 2 天样本（9/11 漏跑 `--watch`，序列已永久丢失）。
+（现在只覆盖持仓检查那一对档位）；② ~~补齐 `obs_1min_archive.json` 的每日归档~~
+—— **v0.23.13 已修复**：根因是 `_load_1min_log()` 跨天时返回 `{}`，
+使调用处轮转判据恒为 False、归档分支成**死代码**。丢失的 9/23 轨迹不可追回
+（`forecast_log.jsonl` 尚存整十点 `rm` 序列，可作整十点粒度代偿），
+**从 2026-09-24 起自动积累**。
 
 ### 2.6 r（结果条件 → 时间条件的转换因子）
 
