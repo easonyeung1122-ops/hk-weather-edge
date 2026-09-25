@@ -17,6 +17,7 @@ scripts/edge_report.html
 # 保留：scripts/data/diurnal_climatology.json（重算需数分钟，开箱即用）
 # 保留：scripts/data/rec_pnl_log.csv（每日建议盈亏台账，用户要求纳入版本控制，勿忽略）
 # 保留：scripts/data/obs_1min_archive.json / remaining_rise_cdf.json
+# 保留：scripts/data/intraday_archive.json（v0.23.13 的日内轮转归档，按日累积，勿忽略）
 
 __pycache__/
 *.pyc
