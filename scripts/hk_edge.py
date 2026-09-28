@@ -26,7 +26,7 @@ Polymarket「香港最高气温」市场 Edge 计算器
 import argparse, json, math, os, re, sys, time, datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "0.23.26"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
+VERSION = "0.23.27"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
 
 # Kelly 缩放：满 Kelly 波动太大、且概率本身有 ±5% 量级误差，实操一律打折。
 # 这里用 35% Kelly（原来是 1/4=25%）。
@@ -658,6 +658,76 @@ def fetch_official_max():
                 'min': float(m.group(3)), 'time': tm.group(1) if tm else None}
     except Exception:
         return None
+
+
+def fetch_warning():
+    """HKO 现时警告（warnsum）—— **纪律 17（v0.23.27）的落码**。
+
+    为什么必须每次打印：2026-09-28 11:15 天文台发出**酷热天气警告（WHOT）**，
+    而 11:15 那一轮盘中的 warnsum 检查与发布时间**赛跑**，报了「无警告」。
+    WHOT 的发布线是「预测最高 ≥ 33 °C」—— 它是 HKO 的**运营级外生锚**，
+    与市场隐含 μ 同级，必须在每次出结论时显式可见，不能靠人记得去查。
+
+    返回 {'codes': [...], 'items': [(code, name, actionCode, issueTime,
+    updateTime)], 'lag_min': 最新一条 updateTime 距本地采样时刻的分钟数}；
+    任何异常一律返回 None（**必须静默失败**，不得打断主流程）。
+    """
+    try:
+        raw = _http_raw('https://data.weather.gov.hk/weatherAPI/opendata/'
+                        'weather.php?dataType=warnsum&lang=en', 20)
+        d = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(d, dict):
+        return None
+    sampled = dt.datetime.now(TZ)
+    items, lags = [], []
+    for code, v in d.items():
+        if not isinstance(v, dict):
+            continue
+        items.append((code, v.get('name', code), v.get('actionCode', '?'),
+                      v.get('issueTime'), v.get('updateTime')))
+        for key in ('updateTime', 'issueTime'):
+            t = v.get(key)
+            if not t:
+                continue
+            try:
+                when = dt.datetime.fromisoformat(t)
+                lags.append((sampled - when).total_seconds() / 60.0)
+            except ValueError:
+                pass
+    items.sort(key=lambda x: x[0])
+    return {'codes': [i[0] for i in items], 'items': items,
+            'lag_min': min(lags) if lags else None,
+            'sampled': sampled.strftime('%H:%M:%S')}
+
+
+def format_warning(w):
+    """把 `fetch_warning()` 的结果压成一行（或 None -> 取不到就明说取不到）。"""
+    if w is None:
+        return ("现时警告: ⚠ 取不到（warnsum 请求失败）—— **不得据此认为无警告**，"
+                "须手工复查")
+    if not w['codes']:
+        return (f"现时警告: 无（warnsum 空，采样 {w['sampled']}）"
+                f"｜★ WHOT 发布线 = 预测最高 ≥33°C，无警告即为一条反向锚")
+    parts = []
+    for code, name, act, iss, upd in w['items']:
+        lag = ''
+        if upd:
+            try:
+                lag = ' 发布 %.0f 分钟前' % (
+                    (dt.datetime.now(TZ) - dt.datetime.fromisoformat(upd))
+                    .total_seconds() / 60.0)
+            except ValueError:
+                pass
+        parts.append(f"{code}({name}, {act}, issue {iss or '—'}{lag})")
+    warn = ''
+    if w['lag_min'] is not None and w['lag_min'] <= 30:
+        warn = ("\n  ⚠ **该警告在 30 分钟内发出 → 本轮有漏报风险，须在同轮内再查一次**"
+                "（纪律 17）")
+    return ("现时警告: " + "；".join(parts)
+            + "\n  ★ 酷热天气警告(WHOT) 发布线 = 预测最高 **≥33°C** → B 簇外生锚，"
+              "须与市场隐含 μ 并列（纪律 17）" + warn)
 
 
 def _cold_pool_path():
@@ -1420,6 +1490,9 @@ def main():
               f" —— 模式更新周期 ≥6h，不影响结论")
     else:
         print(f"数据时效: 实时拉取（{len(_fetch_meta)} 个请求并行）")
+    # 纪律 17（v0.23.27）：现时警告每轮必打印。2026-09-28 11:15 的 WHOT 曾被漏报，
+    # 而那正是当日唯一把中心从 32 推向 33 的外生证据 —— 不能靠人记得去查。
+    print(format_warning(fetch_warning()))
 
     # 当日已实测到的最高温 = 峰值的硬下限，用它截断分布（只对当日生效）
     today = dt.datetime.now(TZ).date().isoformat()
