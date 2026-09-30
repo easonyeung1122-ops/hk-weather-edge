@@ -2893,6 +2893,17 @@ note 被截到「峰值 ∉ [32」，随后 `--settle --write` 立刻把它固�
    与远端 `git ls-remote origin refs/heads/main` 一致（`gh` CLI 未认证，用 `git ls-remote` 代替）。
 6. **收尾自检**：`git status --short` 应只剩预期的 `M ...`，**不应出现任何 `??`**。
 
+7. **文档体量自检（v0.23.32 新增，防复发）**：
+   ```bash
+   "C:/Users/ey/AppData/Local/Programs/Python/Python312/python.exe" -c "print(len(open('SKILL.md',encoding='utf-8').read()))"
+   ```
+   - **上限 130,000 字符**（约 59k token）。超过即**必须先整理再发版**。
+   - **新规则一律写进 §2.11 速查表**（触发 + 阈值 + 动作），原文进 `references/hard_rules_full.md`；
+     **禁止**再往 §2.2 或任何方法论节里追加新的 `#### 硬规则 N`。
+   - 背景：SKILL.md 曾在 2026-09-30 达到 **188,607 字符 / 4,784 行**，其中「§2.2 L（水位）」
+     一个标题下堆了 33 条硬规则、约 1,830 行（占全文 38%），找一条规则要翻 1,800 行。
+     该次整理降到 119,552 字符 / 2,978 行（−37%，内容零删改，全部外置）。
+
 > ⚠ **Windows 下 `git fetch` / `git update-ref` 写 remote-tracking ref 会静默失败**
 > （2026-09-15 实测）：`git fetch origin` 输出 `* [new branch] main -> origin/main` 且 exit 0，
 > 但 `.git/refs/remotes/origin/` 仍是**空目录**、`git branch -vv` 显示 `[origin/main: gone]`、
