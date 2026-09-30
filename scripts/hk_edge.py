@@ -26,7 +26,7 @@ Polymarket「香港最高气温」市场 Edge 计算器
 import argparse, json, math, os, re, sys, time, datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "0.23.31"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
+VERSION = "0.23.32"      # 语义化版本，见 CHANGELOG.md；每次推送 GitHub 前必须递增
 
 # Kelly 缩放：满 Kelly 波动太大、且概率本身有 ±5% 量级误差，实操一律打折。
 # 这里用 35% Kelly（原来是 1/4=25%）。
@@ -1453,11 +1453,30 @@ def main():
                          f'实况与价格永不缓存）')
     ap.add_argument('--no-cache', action='store_true', help='强制实时拉取，绕过缓存')
     ap.add_argument('--no-log', action='store_true',
-                    help='不写 decision_log.csv（情景/敏感性扫描必须加此参数，'
-                         '否则同键多值会污染 Brier 台账）')
+                    help='不写 decision_log.csv。⚠ 执行窗口（10:30–12:00 HKT）内禁用，'
+                         '窗口内扫描请改用语义明确的 --scan（硬规则 33）')
+    ap.add_argument('--scan', action='store_true',
+                    help='情景/敏感性扫描：不写 decision_log.csv。任何时段均可用，'
+                         '是 --no-log 在窗口内的正式替代（硬规则 33）')
     ap.add_argument('--html', action='store_true', help='额外输出 HTML 报告')
     ap.add_argument('--version', action='version', version=f'hk-weather-edge {VERSION}')
     a = ap.parse_args()
+
+    # ── 硬规则 33：执行窗口内禁止静默留白 [v0.23.32，2026-09-30 复盘] ─────────
+    # 实证代价：2026-09-30 窗口内三轮主报告（#3 10:50 / #4 11:05 / #5 11:32）
+    # 全部误带 --no-log → decision_log.csv 在 10:30–12:00 零记录。当日唯一有
+    # 执行价值、也唯一需要 Brier 复盘的时段整段留白，review_brier.py 只能覆盖
+    # 窗口外轮次 → 最贵 90 分钟永久无法复盘。
+    # 规则：窗口内 --no-log 一律拒绝执行；扫描改用语义明确的 --scan（不受限）。
+    if getattr(a, 'no_log', False):
+        _now = dt.datetime.now(TZ)
+        _tgt = dt.date.fromisoformat(a.date) if a.date else _now.date()
+        _hh = _now.hour + _now.minute / 60.0
+        if _tgt == _now.date() and 10.5 <= _hh < 12.0:
+            print("\n🚫 [硬规则 33] 执行窗口（10:30–12:00 HKT）内禁止使用 --no-log。")
+            print("   窗口内是唯一有执行价值、也唯一需要 Brier 复盘的时段，日志不得留白。")
+            print("   情景/敏感性扫描请改用 --scan（显式声明本次为扫描、不写日志）。")
+            raise SystemExit(1)
 
     if a.score:
         score()
@@ -1875,7 +1894,8 @@ def main():
     if _sat:
         print(f"\n🚫 [硬规则26/31] 拒写 decision_log.csv：{', '.join(_sat)} 的分布被 floor 饱和"
               f"（点估计 ≤ 已观测最高 → 已整段作废）→ 该目标日不计入 Brier 台账")
-    if market and _writable and not getattr(a, 'no_log', False):
+    _silent = getattr(a, 'no_log', False) or getattr(a, 'scan', False)
+    if market and _writable and not _silent:
         import csv
         lp = os.path.join(DATA, 'decision_log.csv')
         new = not os.path.exists(lp)
@@ -1890,8 +1910,9 @@ def main():
                                     round(p, 4), market[b], round(p - market[b], 4)])
         print(f"\n[已记录] {len(market)} 档写入 data/decision_log.csv"
               f"（目标日 {', '.join(_writable)}）—— 结算后回来填实际档位做复盘")
-    elif market and _writable and getattr(a, 'no_log', False):
-        print(f"\n[--no-log] 本轮为情景/敏感性扫描，未写 decision_log.csv"
+    elif market and _writable and _silent:
+        _flag = '--scan' if getattr(a, 'scan', False) else '--no-log'
+        print(f"\n[{_flag}] 本轮为情景/敏感性扫描，未写 decision_log.csv"
               f"（目标日 {', '.join(_writable)}）")
 
     if a.html:
