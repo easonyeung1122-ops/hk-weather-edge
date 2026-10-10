@@ -11,7 +11,35 @@
 `SKILL.md` frontmatter 的 `version:`、`scripts/hk_edge.py` 的 `VERSION` 常量、
 以及**本文件下面的「当前版本」行**（最容易漏的一处）。
 
-当前版本：**v0.24.5**（`hk_edge.py --version` 可查）
+当前版本：**v0.24.6**（`hk_edge.py --version` 可查）
+
+## v0.24.6 — 2026-10-10｜10-10 结算（31°C，零腿）+ 归档轮转第十四日
+
+**PATCH：`hk_edge.py` 计算逻辑零改动、台账数字一位未变（46 腿 16-30 / 净 −$1,455.67 / ROI −34.0%）。**
+
+### 一、10-10 结算档 = 31°C（provisional）
+
+| 源 | 值 | 落档 |
+|---|---|---|
+| 官方 1 分钟 `fetch_official_max()`（`max` 为结算同源口径） | **31.1**（min 25.9） | [31.0–32.0) |
+| `obs_1min_log.json` 36 点（10:50–16:40）max @14:20 | **31.0**（缺口 +0.1） | 同上 |
+| `market_prices.py 2026-10-10 --depth 3` | 31 档 **YES bid 0.999**，其余 10 档 NO bid 0.999（24h 量 54,751.8） | 市场已定档 |
+
+`dailyExtract_202610.xml` 21:3x 复核（须带 UA）**仅出到 10-08**（ndays=8），未出 10-09 / 10-10 → **两日均维持 provisional**。`maxt_HKO.csv` 末值仍 2026-08-31（滞后约 6 周，未采信）。
+
+### 二、本日零腿（口径 11 第十五例）
+
+形态 = **「引擎全天未以决策模式运行」**（同 10-08 型，非 10-07 型）：`decision_log.csv` 时点列 10-10 零行（末条仍 10-09 10:34）；会话日志 `2026-10-10.md` 不存在；报告 `hk_weather_20261010*.md` 一份都没有；`rec_pnl.py --open` 前后均「没有未结算的腿」；`watch.log` 10-10 段（silent start 11:00:01 / 17:00 二次启动后 0 采集退出，采集 36 次，915 行）建议 / Kelly / 建议仓位 / 份数 / 执行 / EV / edge **grep 全 0 命中**。
+
+唯一实况痕迹均为**监控**：`forecast_log.jsonl` 33 条 10-10 条目（10:50 rm 28.6 → 16:40 rm 31.1 / pred 31.1 / P(31)=1.0）、`obs_1min_log.json` 36 点（14:20 峰 31.0 → 16:40 收 28.5）。**无候选腿、无「条件成立未执行」样本 → 不新增待拍板项。**
+
+### 三、归档轮转
+
+`obs_1min_archive.json`（17 日键，末键 10-09，38 点 max 30.6）/ `intraday_archive.json`（16 日键，末键 10-09，39 点 max 30.6）已于 10-10 11:00 轮转写入 10-09 段 → **跨天轮转连续第十四日生效**。
+
+### 四、本次仓库改动
+
+`SKILL.md` / `README.md` / `CHANGELOG.md` / `scripts/hk_edge.py`（仅 VERSION）/ `scripts/data/rec_pnl_log.csv`（注释块 669 → 701 行）/ `scripts/data/obs_1min_archive.json` / `scripts/data/intraday_archive.json`。**`PNL.md` 无改动**（零腿日数字不变，md5 `dd56022d…` 未变，未进 commit）。
 
 ## v0.24.5 — 2026-10-09｜10-09 结算（30°C，零腿）+ 10-08 转 confirmed + 首次「官方与快照零缺口」
 
