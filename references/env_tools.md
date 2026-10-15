@@ -125,6 +125,8 @@ cmd 于是把注释当命令执行，刷出满屏「不是内部或外部命令�
 
 | 文件 | 作用 |
 |---|---|
+| `scripts/snapshot.py` | **【v0.25.0新增】一次调用出全部当日证据**：官方 rmax / 0.1°C 站温 / 全港分布 / 今日轨迹 / 峰况三列判定 / 降雨与警告 / 同类日分层（读 `strata.csv`）/ 全档 CLOB ladder + 指定份数卖出 VWAP。并行拉取，实测 2~4s。`--samples 3 --shares 130`。⚠ 证据层聚合，**不替代** §2.11+§3 的判断流程，也不写 `decision_log.csv` |
+| `scripts/build_strata.py` | **【v0.25.0 新增】重建/查询分层表 `data/strata.csv`**：把 `obs_1min_archive.json` 压成「一行一日」长表（`rmax@h` / `inst@h` / `pullback@h` 预计算 + 官方终值回填）。`--summary` 打印三个切面（`rmax@11:00` 分层 / `rmax@13:40` 分层 / 13:40 回撤条件化）。⚠ `official_max` **为空 = 官方 Daily Extract 未出**，不是 0。⚠ 同时是 PENDING §K 读端污染闸门（按 `t[:10]==键名` 过滤 + 拒写 <3 点键）。⚠ **Daily Extract 雨量列可能是字符串 `Trace`**，三列必须各自独立解析 |
 | `scripts/hk_edge.py` | 主程序：拉数据 → 校准 → 公允概率 / edge / Kelly / `--watch` |
 | `scripts/market_prices.py` | **从 CLOB 订单簿取真实可成交价**（取价必用，见 §3.1） |
 | `scripts/diurnal.py` | 生成「某时刻 → 当日峰值」气候升温表（ERA5，跑一次数分钟） |
@@ -143,6 +145,7 @@ cmd 于是把注释当命令执行，刷出满屏「不是内部或外部命令�
 | `scripts/rec_pnl.py` | **建议盈亏台账**：`--settle DATE=N [--status provisional] --write` 回填结算档，`--markdown` 重生 `PNL.md`，`--all-legs` 看未折叠流水 |
 | `scripts/watch_silent.py` | **零窗口轮询入口**：由 `pythonw.exe` 启动，自己开 `watch.log`、带 PID 锁 |
 | `scripts/data/rec_pnl_log.csv` | 每日建议腿的台账（**纳入 git**） |
+| `scripts/data/strata.csv` | **【v0.25.0】分层表**（一行一日）：`rmax@h` / `inst@h` / `pullback@h` 预计算 + `official_max` 官方终值回填。由 `build_strata.py` 生成，勿手改 |
 | `scripts/data/remaining_rise_cdf.json` | 剩余升温 R 的经验分位表（按月×时，ERA5 4266 天） |
 | `scripts/data/obs_1min_archive.json` | 0.1°C 结算站序列**按日归档**，攒够后可重建站点口径分位表 |
 | `scripts/data/forecast_log.jsonl` | 每次 `--watch` 落地的概率向量，`--score` 用它打 Brier |

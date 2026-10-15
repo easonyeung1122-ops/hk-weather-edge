@@ -1,6 +1,6 @@
 ---
 name: hk-weather-edge
-version: 0.24.10
+version: 0.25.0
 description: Polymarket「香港最高气温」日度市场的 edge 计算与实况外推工具。把香港天文台(HKO)开放数据 + Open-Meteo 多模式 NWP 集合转为校准后的摄氏整数档(bucket)公允概率，并与市场价对比输出 EV 与 35% Kelly 仓位建议；`--watch` 模式基于结算站实测 + 日内气候曲线做当日峰值 nowcast。当用户提到「香港气温市场」「最高气温预测」「HKO / 天文台结算」「bucket 概率」「temperature bucket edge」「今天香港会到几度」「 polymarket weather Hong Kong」，或需要判断某个整数档是否值得买 YES / NO 时使用。
 ---
 
@@ -40,6 +40,38 @@ description: Polymarket「香港最高气温」日度市场的 edge 计算与实
 
 | **某个规则哪来的、是不是废了** | `references/archive_retracted.md` |
 | **查接口字段 / Windows 运行 / 缓存** | `references/env_tools.md` |
+| **⭐ 取当日证据（实况+轨迹+分层+盘口）** | **直接跑 `scripts/snapshot.py`**（一次调用出全部，§1.4 有用法）——不要手工逐个接口取 |
+| **⭐ 查同类日分层（rmax@h → 官方终值）** | **直接跑 `scripts/build_strata.py --summary`**（表已预落 `data/strata.csv`）——不要现场遍历 archive |
+
+---
+
+## 0. 快速开始（v0.25.0 新增）
+
+出结论前的**标准三步**。这三步覆盖了历史上90% 的工具调用，别再手工逐个接口取数。
+
+```bash
+cd<skill根>            # Windows 下用 C:/Users/ey/.workbuddy/skills/hk-weather-edge
+
+# ① 重建分层表（每天首次；或官方 Daily Extract 出了新终值后）
+py -3 scripts/build_strata.py --summary
+
+# ② 一次拿到当日全部证据（实况 / 轨迹 / 峰况 / 分层 / 盘口 ladder VWAP）
+py -3 scripts/snapshot.py --samples 3 --shares 130
+#   --samples 3  满足硬规则 28「单书多次采样」；--shares 给已有腿的退出 ladder VWAP
+
+# ③ 公允概率与 EV（引擎侧，唯一写 decision_log 的入口）
+py -3 scripts/hk_edge.py --watch --no-cache
+```
+
+**为什么要有 ①②**：2026-10-15 一次「更新预测」消耗 **68 次工具调用 / 约 25 分钟**，
+其中约 20 次是**同一批数据的反复取数与结构探索**（官方 rmax 取 4 次、站温 5 次、
+订单簿 6 次、遍历 archive 算分层 4 次、json 键名/列序/token 顺序探索 ~8 次）。
+①②把其中 ~20 次调用压成 2 次，实测**单次 2~4 秒**（并行拉取）。
+
+⚠ ①② **不替代** §3 的判断流程：它们是**证据层聚合**，输出给人看；
+公允概率、EV、Kelly、腿卡仍按 §2.11 + §3 在引擎侧算。
+
+---
 
 **盘中判读顺序（v0.16.5 教训：规则写在文档、实现只落一半，读者第一眼看到的仍是被污染的结论）**：
 
@@ -237,6 +269,48 @@ HK Observatory   28.0   83   28.7 / 26.1   -3.3
 
 取**最近的那个**未到时刻。当日且在峰值窗口内 → 取 10 分钟点；否则取 NWP / fnd。
 已过目标日 20:00 HKT（= 12:00 UTC 收盘）→ 输出「已收盘，不再重跑」，改为提醒回填 `decision_log.csv`。
+
+### 1.4 数据 schema 与 token 顺序速查（v0.25.0 新增）
+
+> **为什么有这节**：2026-10-15 一次更新预测里，约 **8 次工具调用纯粹花在猜数据结构上**
+> （json 键名、CSV 列序、`clobTokenIds` 的 token 顺序）。这些**全部是固定的**，
+> 写死在这里就不用再猜。**先查本节，再写代码。**
+
+**⚠ 三个最常踩的坑（各自都造成过一次实际误判）**
+
+| 坑 | 正确写法 | 踩过的后果 |
+|---|---|---|
+| `clobTokenIds[0]` **不保证**是 YES | **必须标定**：用「已出局档」（token[0] 报价≈0）或「已锁定档」（≈1）反推 | 猜成 NO → 把 NO30 读成 YES30，**结论完全反向** |
+| CLOB **逐个单书连发会返回 HTTP 400** | 用批量 `POST /books` 一次拿全22 个 | 先访问 Gamma 再连发必失败 → 误判「盘口取不到」 |
+| Daily Extract 雨量列**可能不是数字** | `r[8]` 可能是字符串 `Trace`（微量雨）→ **三列各自独立解析** | `float(r[8])` 抛异常若与 max/min 同处一个 try → **整行被丢，连当日的 official max 一起丢**（10-08/10-12/10-14 三天全中，丢掉的恰是最同类的日子） |
+
+**本地文件 schema**
+
+| 文件 | 结构 | 关键点 |
+|---|---|---|
+| `data/obs_1min_log.json` | `{date, points:[{t, hko}]}` | 当日轨迹。**跨天自动作废**（`date != today` 返回空）；`t` 是 `YYYY-MM-DDTHH:MM:SS+08:00` |
+| `data/obs_1min_archive.json` | `{ 'YYYY-MM-DD': [{t, hko}] }` | **已确认被混入外来点**（05-29 污染 10-13段）。读端必须按 `t[:10] == 键名` 过滤 + 拒写 <3 点的键 → `build_strata.py` 的 `clean_points()` 已实现 |
+| `data/intraday_log.json` | 同上，但每点含 `all:{站名:温度}` | `--watch` 记录；全港分布只能从这里拿 |
+| `data/strata.csv` | 长表，一行一日，列见下| **`official_max` 为空 = 官方 Daily Extract 未出**，不是 0；不得填 0 顶替 |
+| `data/decision_log.csv` | `logged_at,target_date,bucket,fair_p,market_p,edge` | ⚠ **第2 列是「目标日」不是「轮次日」** → grep 日期会命中前一日扫描的未来目标日行。判「本日是否有引擎轮次」**必须看第 1 列时间戳** |
+| `data/rec_pnl_log.csv` | 见文件头注释块（10 列） | `#` 注释**只能写在文件头注释块内**；`--write` 前查 `列数 == 10`；**note 禁写半角逗号** |
+| `data/forecast_log.jsonl` | `{date, t, hour, rm, pred, probs}` | 每次 `--watch` 落地，`review_brier.py` 打Brier 用 |
+
+**`strata.csv` 列**：`date, npts, rmax_all, official_max, rain_final,
+rmax_1000/1100/1130/1200/1300/1340/1400/1430/1500, inst_1100/1340/1400,
+pullback_1100/1340/1400` —— `rmax_<HHMM>` 是该时点的 running max，
+`inst_<HHMM>` 是该时点瞬时值，`pullback` = 前者减后者。
+
+**外部接口的坑位速查**（完整版见 `references/env_tools.md` §7-C）
+
+| 接口 | 坑 |
+|---|---|
+| Open-Meteo `models=a,b,c` | `daily` 键**带模式后缀**：`temperature_2m_max_ecmwf_ifs025`，不是 `temperature_2m_max` |
+| HKO `fnd` | 字段是 **`forecastMaxtemp`**（小写 t）+嵌套 `{value,unit}`；当日条目可能已从列表移除 |
+| HKO `rhrread` | `temperature` **只有整数位**且每小时更新 → **禁止用于定档位**（误差 0~−0.9°C，恰是跨档量级） |
+| 分区 CSV | 结算站名是 `HK Observatory`（不是 `Hong Kong Observatory`）；发布滞后 10~25 分钟 |
+| 官方 text_readings | 抓 `textonly/v2/forecast/`，站名写**简写**；镜像 `wxinfo/ts/` 版式不同，正则匹配不到 |
+| Daily Extract | 名为 `.xml` **实返回 JSON**；列序 `[2]`=日最高 `[4]`=日最低 `[8]`=雨量；末尾 `Mean/Total`、`Normal` 两行非数据 |
 
 ---
 
