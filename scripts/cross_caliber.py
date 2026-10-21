@@ -139,7 +139,9 @@ def build_methods():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--date", required=True)
-    ap.add_argument("--r11", type=float, required=True)
+    ap.add_argument("--r11", type=float, required=True,
+                    help="结算站 running max @11:00（口径锚）。必须喂 11:00 的值，"
+                         "不得喂当前最新 rmax —— 样本侧 r11 全部是 11:00 值，换口径即漂移")
     ap.add_argument("--market", default="")
     ap.add_argument("--gpeak", type=float, default=None)
     ap.add_argument("--g1050", type=float, default=None)
@@ -163,6 +165,28 @@ def main():
         print("缺 7M 网格输入（--gpeak/--g1050 或 %s 的 %s 键）" % (os.path.basename(GRID92), a.date))
         return 2
     T = dict(r11=a.r11, gmax=gpeak, g1050=g1050)
+    # 口径校验：--r11 必须是 11:00 的 rmax。喂当前最新 rmax = 跨口径引用（2026-10-21 11:45 实踩）。
+    _log = os.path.join(DATA, "obs_1min_log.json")
+    if os.path.exists(_log):
+        try:
+            with open(_log, encoding="utf-8") as f:
+                _pts = [p for p in json.load(f).get("points", [])
+                        if p.get("hko") is not None and p.get("t", "")[:10] == a.date]
+            if _pts:
+                _upto11 = [p["hko"] for p in _pts if p["t"][11:16] <= "11:00"]
+                _r11 = max(_upto11) if _upto11 else None
+                _rmax = max(p["hko"] for p in _pts)
+                if _r11 is not None and abs(a.r11 - _r11) > 0.05:
+                    print("🚨 口径漂移：--r11=%.2f 但 %s 的 rmax@11:00 = %.2f（当前最新 rmax=%.2f）。"
+                          "\n   LOOCV 样本的 r11 全部是 11:00 值，喂最新 rmax 会让今日输入与样本异源。"
+                          "\n   应改用 --r11 %.2f；当前最新 rmax 只作增量信息报告，不得喂入模型。"
+                          % (a.r11, a.date, _r11, _rmax, _r11))
+                elif _rmax is not None and _rmax > a.r11 + 0.05:
+                    print("信息：r11@11:00 = %.2f（已采用）｜ 当前最新 rmax = %.2f（较 11:00 +%.1f °C），"
+                          "该增量只作参考，不回灌模型"
+                          % (a.r11, _rmax, _rmax - a.r11))
+        except Exception as e:
+            print("（口径校验跳过: %s）" % e)
     # 当日网格必须显式传最新 run：previous-runs 缓存是数小时前的 run，
     # 与当前 forecast run 可差 0.3°C+。差异必须显式披露，不得静默混用（规则 49 同源精神）。
     if a.gpeak is None and grid_today.get("gpeak") is not None:
