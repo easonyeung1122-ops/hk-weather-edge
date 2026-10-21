@@ -266,11 +266,15 @@ def main():
             tids, meta = [], {}
             for m in ev["markets"]:
                 t = (m.get("groupItemTitle") or "").strip()
-                if not re.match(r"^\d+", t):
+                # 只认纯整数档（"33°C"）；"28°C or below" 这类区间标题必须跳过，
+                # 否则 int() 解析崩掉（2026-10-21 实踩）。
+                mt = re.match(r"^(\d+)\s*°?C?$", t)
+                if not mt:
                     continue
+                bkt = int(mt.group(1))
                 toks = json.loads(m["clobTokenIds"])
-                meta[toks[0]] = (int(t[:-2]), "YES")
-                meta[toks[1]] = (int(t[:-2]), "NO")
+                meta[toks[0]] = (bkt, "YES")
+                meta[toks[1]] = (bkt, "NO")
                 tids += list(toks)
             payload = json.dumps([{"token_id": t} for t in tids]).encode()
             req = urllib.request.Request("https://clob.polymarket.com/books", data=payload, headers=UA)
