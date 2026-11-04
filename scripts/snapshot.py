@@ -303,7 +303,14 @@ def books(date_iso):
             continue
         if len(toks) < 2:
             continue
-        out['buckets'].append({'level': int(m.group(1)), 'label': t, 'tokens': toks})
+        # Gamma 的 outcomes 字段与 clobTokenIds 同序，权威标注每个 token 是Yes/No。
+        # 2026-10-19 新增：这是唯一在「提前一天 / 无已锁定档」时仍成立的标定锚点。
+        try:
+            outs = [str(x).strip().lower() for x in json.loads(mk.get('outcomes') or '[]')]
+        except Exception:
+            outs = []
+        out['buckets'].append({'level': int(m.group(1)), 'label': t, 'tokens': toks,
+                               'outcomes': outs})
     out['buckets'].sort(key=lambda x: x['level'])
     return out
 
@@ -374,7 +381,7 @@ def _tok_px(entry):
     return asks[0][0] if asks else None
 
 
-def calibrate(books, owner, official_rmax):
+def calibrate(books, owner, official_rmax, buckets=None):
     """判定 token[0] 是 YES 还是 NO。返回 (True, 'YES', 锚点名) 等。
 
     2026-10-15 实测教训：曾假设 token[0]=NO，把 NO30 读成 YES30，结论完全反向。
@@ -387,8 +394,28 @@ def calibrate(books, owner, official_rmax):
     锚点 B「已出局档」：明显低于 rmax 的档（如 rmax 29.7 时的 28 档，YES 早输），
       token[0] 报价必然≈0。10-15 实测：28 档 token[0] bid 为空、ask 0.001。
 
+    锚点 C「Gamma outcomes 字段」`[v0.25.4，2026-10-19 新增]`：
+      `mk['outcomes']` 与 `mk['clobTokenIds']` **同序**，直接写明每个 token 是 Yes 还是 No。
+      这是**元数据而非价格推断**，因此在两类场景下仍然成立：
+        ① 提前一天（目标日≠今天）—— A/B 两个价格锚点都不适用（今天没有「已锁定档」）；
+        ② 全部档都在 [0.2, 0.8] 区间、无任何一档贴近 0 或 1。
+      10-19 复算：Gamma 全档 `outcomes` 均为 `["Yes","No"]` → token[0]=YES；
+      用已结算日反向验证（10-16/10-17 均 29 档 YES=0.9995、28/30 档 YES=0.0005）一致。
+      **优先级：C > A > B**（C 无推断成分，A/B 依赖实时报价、可能因深度不足而失真）。
+
     两锚点都失效时返回False → 调用方必须拒绝使用价格（宁可不报，不可报错方向）。
     """
+    # ---- 锚点 C：Gamma outcomes 元数据（最高优先级，无推断成分） ----
+    if buckets:
+        votes = set()
+        for b in buckets:
+            outs = b.get('outcomes') or []
+            if len(outs) >= 2 and outs[0] in ('yes', 'no'):
+                votes.add(outs[0])
+        if len(votes) == 1:
+            v = votes.pop()
+            return True, ('YES' if v == 'yes' else 'NO'), 'Gamma outcomes 字段（%d/%d 档一致）' % (
+                sum(1 for b in buckets if (b.get('outcomes') or [None])[0] == v), len(buckets))
     if not owner:
         return False, None, None
     probe = []
@@ -600,7 +627,7 @@ def main():
     if ev.get('buckets'):
         try:
             bks, owner = fetch_all_books(ev)
-            cal = calibrate(bks, owner, rmax)
+            cal = calibrate(bks, owner, rmax, ev.get('buckets'))
         except Exception as e:
             cal = (False, None, None)
             print('[warn] 批量订单簿失败，盘口不可用: %s' % e, file=sys.stderr)
